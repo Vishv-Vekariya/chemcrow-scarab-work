@@ -1,0 +1,6 @@
+{
+  "bundle_tool":"bundle_trace_humza_layout.py",
+  "source_workload_dir":"/proj/datacntr-effcy-PG0/exp/nvilva/scarab_simpoint_flow/gapbc_webstanford_v2/bc_webstanford",
+  "representative_segment":"120",
+  "note":"Original trace_clustering_info.json was not present in the workload tree."
+}

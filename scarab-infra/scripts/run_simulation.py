@@ -1,0 +1,559 @@
+#!/usr/bin/python3
+
+# 01/27/2025 | Surim Oh | run_simulation.py
+# An entrypoint script that performs Scarab runs on Slurm clusters using docker containers or on local
+
+import subprocess
+import argparse
+import os
+import sys
+import re
+from pathlib import Path
+from typing import Dict, List, Set, Tuple
+import docker
+
+from .utilities import (
+    info,
+    note,
+    err,
+    warn,
+    read_descriptor_from_json,
+    remove_docker_containers,
+    remove_tmp_run_scripts,
+    get_image_list,
+    prepare_simulation,
+    get_image_name,
+    validate_simulation,
+    is_container_running,
+    count_interactive_shells,
+    run_on_node,
+)
+from . import slurm_runner, local_runner
+
+client = docker.from_env()
+CONTAINER_PROBE_TIMEOUT_SECONDS = 5
+
+# Verify the given descriptor file
+def verify_descriptor(
+    descriptor_data,
+    workloads_data,
+    open_shell=False,
+    warn_existing_experiment=False,
+    dbg_lvl=2,
+):
+    ## Check if the provided json describes all the valid data
+
+    # Check the descriptor type
+    if not descriptor_data["descriptor_type"]:
+        err("Descriptor type must be 'simulation' for a simulation descriptor", dbg_lvl)
+        exit(1)
+
+    # Check the scarab path
+    if descriptor_data["scarab_path"] == None:
+        err("Need path to scarab path. Set in descriptor file under 'scarab_path'", dbg_lvl)
+        exit(1)
+
+    # Check the scarab build mode
+    if descriptor_data["scarab_build"] != None and descriptor_data["scarab_build"] not in ('opt', 'opt-avx', 'dbg'):
+        err("Need a valid scarab build mode ('opt', 'opt-avx', 'dbg', or null). Set in descriptor file under 'scarab_build'", dbg_lvl)
+        exit(1)
+
+    # Check if a correct architecture spec is provided
+    if descriptor_data["architecture"] == None:
+        err("Need an architecture spec to simulate. Set in descriptor file under 'architecture'. Available architectures are found from PARAMS.<architecture> in scarab repository. e.g) sunny_cove", dbg_lvl)
+        exit(1)
+    elif not os.path.exists(f"{descriptor_data['scarab_path']}/src/PARAMS.{descriptor_data['architecture']}"):
+        err(f"PARAMS.{descriptor_data['architecture']} does not exist. Please provide an available architecture for scarab simulation", dbg_lvl)
+        exit(1)
+
+    # Check experiment doesn't already exists
+    experiment_dir = f"{descriptor_data['root_dir']}/simulations/{descriptor_data['experiment']}"
+    if warn_existing_experiment and os.path.exists(experiment_dir) and not open_shell:
+        print(f"Experiment '{experiment_dir}' already exists. It will overwrite the existing simulation results!")
+
+    # Check if each simulation type is valid
+    validate_simulation(workloads_data, descriptor_data['simulations'])
+
+    # Check the workload manager
+    if descriptor_data["workload_manager"] != "manual" and descriptor_data["workload_manager"] != "slurm":
+        err("Workload manager options: 'manual' or 'slurm'.", dbg_lvl)
+        exit(1)
+
+    # Check if docker home path is provided
+    if descriptor_data["root_dir"] == None:
+        err("Need path to docker home directory. Set in descriptor file under 'root_dir'", dbg_lvl)
+        exit(1)
+
+    # Check if the provided scarab path exists
+    if descriptor_data["scarab_path"] == None:
+        err("Need path to scarab directory. Set in descriptor file under 'scarab_path'", dbg_lvl)
+        exit(1)
+    elif not os.path.exists(descriptor_data["scarab_path"]):
+        err(f"{descriptor_data['scarab_path']} does not exist.", dbg_lvl)
+        exit(1)
+
+    # Check if trace dir exists
+    if descriptor_data["traces_dir"] == None:
+        err("Need path to simpoints and traces. Set in descriptor file under 'traces_dir'", dbg_lvl)
+        exit(1)
+    elif not os.path.exists(descriptor_data["traces_dir"]):
+        err(f"{descriptor_data['traces_dir']} does not exist.", dbg_lvl)
+        exit(1)
+
+    # Check if configurations are provided
+    if descriptor_data["configurations"] == None:
+        err("Need configurations to simulate. Set in descriptor file under 'configurations'", dbg_lvl)
+        exit(1)
+
+def open_interactive_shell(user, descriptor_name, descriptor_data, workloads_data, infra_dir, dbg_lvl = 1):
+    experiment_name = descriptor_data["experiment"]
+    scarab_path = descriptor_data["scarab_path"]
+    application_dir = descriptor_data.get("application_dir", ".")
+    scarab_binaries: List[str] = []
+    configurations = descriptor_data.get("configurations") or {}
+    if isinstance(configurations, dict):
+        for config in configurations.values():
+            if not isinstance(config, dict):
+                continue
+            binary = config.get("binary")
+            if binary:
+                binary_name = str(binary)
+                if binary_name not in scarab_binaries:
+                    scarab_binaries.append(binary_name)
+    if not scarab_binaries:
+        scarab_binaries = ["scarab_current"]
+    try:
+        # Get user for commands
+        user = subprocess.check_output("whoami").decode('utf-8')[:-1]
+        info(f"User detected as {user}", dbg_lvl)
+
+        # Get a local user/group ids
+        local_uid = os.getuid()
+        local_gid = os.getgid()
+
+        # Get GitHash
+        try:
+            githash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode("utf-8").strip()
+            info(f"Git hash: {githash}", dbg_lvl)
+        except FileNotFoundError:
+            err("Error: 'git' command not found. Make sure Git is installed and in your PATH.")
+        except subprocess.CalledProcessError:
+            err("Error: Not in a Git repository or unable to retrieve Git hash.")
+
+        scarab_git_hash = None
+        try:
+            scarab_git_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=scarab_path).decode("utf-8").strip()
+            info(f"Scarab git hash: {scarab_git_hash}", dbg_lvl)
+        except Exception as exc:  # pragma: no cover - best-effort logging for interactive shell
+            warn(f"Could not read scarab git hash: {exc}", dbg_lvl)
+
+        # TODO: always make sure to open the interactive shell on a development node (not worker nodes) if slurm mode
+        # need to maintain the list of nodes for development
+        # currently open it on local
+
+        docker_prefix = get_image_name(workloads_data, descriptor_data['simulations'][0])
+        docker_prefix_list = [docker_prefix]
+        docker_home = descriptor_data['root_dir']
+        experiment_workdir = None
+        experiment_workdir_host = Path(docker_home) / "simulations" / experiment_name
+        try:
+            experiment_workdir_host.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        if experiment_workdir_host.is_dir():
+            experiment_workdir = f"/home/{user}/simulations/{experiment_name}"
+        default_workdir = f"/home/{user}"
+
+        # Set the env for simulation again (already set in Dockerfile.common) in case user's bashrc overwrite the existing ones when the home directory is mounted
+        bashrc_path = f"{docker_home}/.bashrc"
+        entry = "source /usr/local/bin/user_entrypoint.sh"
+        with open(bashrc_path, "a+") as f:
+            f.seek(0)
+            if entry not in f.read():
+                f.write(f"\n{entry}\n")
+
+        # Generate commands for executing in users docker and sbatching to nodes with containers
+        try:
+            scarab_githash, image_tag_list = prepare_simulation(user,
+                                                scarab_path,
+                                                descriptor_data['scarab_build'],
+                                                docker_home,
+                                                experiment_name,
+                                                descriptor_data['architecture'],
+                                                docker_prefix_list,
+                                                githash,
+                                                infra_dir,
+                                                scarab_binaries,
+                                                interactive_shell=True,
+                                                dbg_lvl=dbg_lvl,
+                                                rebuild_hint=f"./sci --build-scarab {descriptor_name}")
+        except Exception as exc:
+            warn(f"Scarab build failed; continuing to interactive shell anyway: {exc}", dbg_lvl)
+            scarab_githash = scarab_git_hash if scarab_git_hash else "unknown"
+            image_tag_list = [f"{docker_prefix}:{githash}"]
+        workload = descriptor_data['simulations'][0]['workload']
+        mode = descriptor_data['simulations'][0]['simulation_type']
+
+        docker_container_name = f"{docker_prefix}_{experiment_name}_scarab_{scarab_githash}_{user}"
+        traces_dir = descriptor_data["traces_dir"]
+        docker_home = descriptor_data["root_dir"]
+        try:
+            # If the container is already running, log into it by openning another interactive shell
+            if is_container_running(docker_container_name, dbg_lvl):
+                workdir = experiment_workdir if experiment_workdir else default_workdir
+                subprocess.run(["docker", "exec", "--privileged", "-it", f"--user={user}", f"--workdir={workdir}", docker_container_name, "/bin/bash"])
+            else:
+                info(f"Create a new container for the interactive mode", dbg_lvl)
+                subprocess.run(["docker", "run", "--privileged",
+                                "-e", f"user_id={local_uid}",
+                                "-e", f"group_id={local_gid}",
+                                "-e", f"username={user}",
+                                "-e", f"HOME=/home/{user}",
+                                "-e", f"APP_GROUPNAME={docker_prefix}",
+                                "-e", f"APPNAME={workload}",
+                                "-dit", "--name", f"{docker_container_name}",
+                                "--mount", f"type=bind,source={traces_dir},target=/simpoint_traces,readonly=true",
+                                "--mount", f"type=bind,source={docker_home},target=/home/{user},readonly=false",
+                                "--mount", f"type=bind,source={scarab_path},target=/scarab,readonly=false",
+                                "--mount", f"type=bind,source={application_dir},target=/tmp_home/application,readonly=false",
+                                f"{docker_prefix}:{githash}", "/bin/bash"], check=True, capture_output=True, text=True)
+                subprocess.run(["docker", "cp", f"{infra_dir}/scripts/utilities.sh", f"{docker_container_name}:/usr/local/bin"],
+                               check=True, capture_output=True, text=True)
+                subprocess.run(["docker", "cp", f"{infra_dir}/common/scripts/root_entrypoint.sh", f"{docker_container_name}:/usr/local/bin"],
+                               check=True, capture_output=True, text=True)
+                subprocess.run(["docker", "cp", f"{infra_dir}/common/scripts/user_entrypoint.sh", f"{docker_container_name}:/usr/local/bin"],
+                               check=True, capture_output=True, text=True)
+                if os.path.exists(f"{infra_dir}/workloads/{docker_prefix}/workload_root_entrypoint.sh"):
+                    subprocess.run(["docker", "cp", f"{infra_dir}/workloads/{docker_prefix}/workload_root_entrypoint.sh", f"{docker_container_name}:/usr/local/bin"],
+                                   check=True, capture_output=True, text=True)
+                if os.path.exists(f"{infra_dir}/workloads/{docker_prefix}/workload_user_entrypoint.sh"):
+                    subprocess.run(["docker", "cp", f"{infra_dir}/workloads/{docker_prefix}/workload_user_entrypoint.sh", f"{docker_container_name}:/usr/local/bin"],
+                                   check=True, capture_output=True, text=True)
+                if mode == "memtrace":
+                    subprocess.run(["docker", "cp", f"{infra_dir}/common/scripts/run_memtrace_single_simpoint.sh", f"{docker_container_name}:/usr/local_bin"],
+                                   check=True, capture_output=True, text=True)
+                elif mode == "pt":
+                    subprocess.run(["docker", "cp", f"{infra_dir}/common/scripts/run_pt_single_simpoint.sh", f"{docker_container_name}:/usr/local/bin"],
+                                   check=True, capture_output=True, text=True)
+                elif mode == "exec":
+                    subprocess.run(["docker", "cp", f"{infra_dir}/common/scripts/run_exec_single_simpoint.sh", f"{docker_container_name}:/usr/local/bin"],
+                                   check=True, capture_output=True, text=True)
+                subprocess.run(["docker", "exec", "--privileged", f"{docker_container_name}", "/bin/bash", "-c", "/usr/local/bin/root_entrypoint.sh"],
+                               check=True, capture_output=True, text=True)
+                workdir = experiment_workdir if experiment_workdir else default_workdir
+                subprocess.run(["docker", "exec", "--privileged", "-it", f"--user={user}", f"--workdir={workdir}", docker_container_name, "/bin/bash"])
+        except KeyboardInterrupt:
+            if count_interactive_shells(docker_container_name, dbg_lvl) == 1:
+                subprocess.run(["docker", "exec", "--privileged", f"--user={user}", f"--workdir=/home/{user}", docker_container_name,
+                                "sed", "-i", "/source \\/usr\\/local\\/bin\\/user_entrypoint.sh/d", f"/home/{user}/.bashrc"], check=True, capture_output=True, text=True)
+                subprocess.run(["docker", "rm", "-f", f"{docker_container_name}"], check=True, capture_output=True, text=True)
+            return
+        finally:
+            try:
+                if count_interactive_shells(docker_container_name, dbg_lvl) == 1:
+                    subprocess.run(["docker", "exec", "--privileged", f"--user={user}", f"--workdir=/home/{user}", docker_container_name,
+                                    "sed", "-i", "/source \\/usr\\/local\\/bin\\/user_entrypoint.sh/d", f"/home/{user}/.bashrc"], check=True, capture_output=True, text=True)
+                    client.containers.get(docker_container_name).remove(force=True)
+                    print(f"Container {docker_container_name} removed.")
+            except docker.errors.NotFound as e:
+                print(f"Container {docker_container_name} not found.")
+                raise e
+            except Exception as e:
+                raise e
+    except Exception as e:
+        raise e
+
+
+def find_conflicting_containers(workload_manager, docker_prefix_list, experiment_name, user, dbg_lvl=2):
+    if not docker_prefix_list:
+        return {}, {}
+
+    patterns = [
+        re.compile(fr"^{re.escape(docker_prefix)}_.*_{re.escape(experiment_name)}.*_.*_{re.escape(user)}$")
+        for docker_prefix in docker_prefix_list
+    ]
+    active_job_names: Set[str] = set()
+    stale_conflicts: Dict[str, List[str]] = {}
+    active_conflicts: Dict[str, List[str]] = {}
+
+    if workload_manager == "slurm":
+        try:
+            queued_or_running = slurm_runner.check_slurm_task_queued_or_running(
+                docker_prefix_list,
+                experiment_name,
+                user,
+                dbg_lvl,
+            )
+            for jobs in queued_or_running.values():
+                active_job_names.update(jobs)
+        except Exception as exc:
+            warn(f"Unable to query slurm queue for preflight orphan check: {exc}", dbg_lvl)
+
+    def split_matching_containers(container_rows: List[str], assume_running=False) -> Tuple[List[str], List[str]]:
+        active: List[str] = []
+        stale: List[str] = []
+        for row in container_rows:
+            line = row.strip()
+            if not line:
+                continue
+            if "\t" in line:
+                name, state = line.split("\t", 1)
+            else:
+                parts = line.split(maxsplit=1)
+                name = parts[0]
+                state = parts[1] if len(parts) > 1 else ""
+
+            if not any(pattern.match(name) for pattern in patterns):
+                continue
+
+            state_is_running = assume_running or state.strip().lower() == "running"
+            if workload_manager == "slurm":
+                # Consider a container active only when it matches an active slurm job name.
+                if name in active_job_names:
+                    active.append(name)
+                else:
+                    stale.append(name)
+            else:
+                # For local/manual mode, running containers are considered active.
+                if state_is_running:
+                    active.append(name)
+                else:
+                    stale.append(name)
+        return active, stale
+
+    def summarize_probe_failure(exc: Exception) -> str:
+        details: List[str] = []
+        stdout = getattr(exc, "stdout", None)
+        stderr = getattr(exc, "stderr", None)
+        if stdout:
+            details.append(f"stdout: {stdout.strip()}")
+        if stderr:
+            details.append(f"stderr: {stderr.strip()}")
+        if details:
+            return f"{exc} ({'; '.join(details)})"
+        return str(exc)
+
+    if workload_manager == "manual":
+        try:
+            result = subprocess.run(
+                ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except Exception as exc:
+            warn(f"Unable to list local docker containers for preflight check: {exc}", dbg_lvl)
+            return stale_conflicts, active_conflicts
+
+        active_local, stale_local = split_matching_containers(result.stdout.splitlines())
+        if active_local:
+            active_conflicts["local"] = active_local
+        if stale_local:
+            stale_conflicts["local"] = stale_local
+        return stale_conflicts, active_conflicts
+
+    node_entries = slurm_runner.list_cluster_nodes(dbg_lvl)
+    if not node_entries:
+        return stale_conflicts, active_conflicts
+
+    for node, state in node_entries:
+        normalized_state = state.lower()
+        if any(token in normalized_state for token in ("down", "drain", "fail", "maint", "unk")):
+            continue
+
+        try:
+            result = run_on_node(
+                ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}"],
+                node=node,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=CONTAINER_PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            note(
+                f"Skipping stale-container probe on {node}: preflight docker listing timed out after {CONTAINER_PROBE_TIMEOUT_SECONDS}s",
+                dbg_lvl,
+            )
+            continue
+        except Exception as first_exc:
+            try:
+                # Busy nodes can fail the fast-fail probe even though they are
+                # still healthy. Retry once without --immediate and rely on the
+                # subprocess timeout to keep the preflight bounded.
+                result = run_on_node(
+                    ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}"],
+                    node=node,
+                    immediate=None,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=CONTAINER_PROBE_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as retry_exc:
+                note(
+                    f"Skipping stale-container probe on {node}: fast probe failed and retry timed out after {CONTAINER_PROBE_TIMEOUT_SECONDS}s",
+                    dbg_lvl,
+                )
+                continue
+            except Exception as retry_exc:
+                warn(
+                    f"Unable to list docker containers on {node} for preflight check: "
+                    f"{summarize_probe_failure(first_exc)}; retry without --immediate also failed: "
+                    f"{summarize_probe_failure(retry_exc)}",
+                    dbg_lvl,
+                )
+                continue
+
+        active_node, stale_node = split_matching_containers(result.stdout.splitlines())
+        if active_node:
+            active_conflicts[node] = active_node
+        if stale_node:
+            stale_conflicts[node] = stale_node
+
+    return stale_conflicts, active_conflicts
+
+
+def run_simulation_command(descriptor_path, action, dbg_lvl=2, infra_dir=None):
+    if infra_dir is None:
+        infra_dir = subprocess.check_output(["pwd"]).decode("utf-8").split("\n")[0]
+
+    user = subprocess.check_output("whoami").decode('utf-8').strip()
+    info(f"User detected as {user}", dbg_lvl)
+
+    descriptor_data = read_descriptor_from_json(descriptor_path, dbg_lvl)
+    if descriptor_data is None:
+        raise RuntimeError(f"Failed to read descriptor {descriptor_path}")
+
+    workload_db_path = f"{infra_dir}/workloads/workloads_top_simp.json" if descriptor_data.get("top_simpoint") else f"{infra_dir}/workloads/workloads_db.json"
+    workloads_data = read_descriptor_from_json(workload_db_path, dbg_lvl)
+    if workloads_data is None:
+        raise RuntimeError("Failed to read workloads database")
+
+    workload_manager = descriptor_data.get("workload_manager")
+    experiment_name = descriptor_data.get("experiment")
+    simulations = descriptor_data.get("simulations") or []
+
+    docker_image_list = get_image_list(simulations, workloads_data)
+
+    try:
+        if action == "kill":
+            try:
+                verify_descriptor(descriptor_data, workloads_data, False, False, dbg_lvl)
+            except SystemExit as exc:
+                return 1
+            if workload_manager == "manual":
+                local_runner.kill_jobs(user, "simulation", experiment_name, docker_image_list, infra_dir, dbg_lvl)
+            else:
+                should_clean = slurm_runner.kill_jobs(user, experiment_name, docker_image_list, dbg_lvl)
+                if not should_clean:
+                    return 0
+                slurm_runner.clean_containers(user, experiment_name, docker_image_list, dbg_lvl)
+                descriptor_root = Path(descriptor_data["root_dir"])
+                experiment_dir = descriptor_root / "simulations" / experiment_name
+                remove_tmp_run_scripts(Path(infra_dir), experiment_name, user, dbg_lvl)
+                remove_tmp_run_scripts(experiment_dir, experiment_name, user, dbg_lvl)
+            remove_docker_containers(docker_image_list, experiment_name, user, dbg_lvl)
+            return 0
+
+        if action == "info":
+            try:
+                verify_descriptor(descriptor_data, workloads_data, False, False, dbg_lvl)
+            except SystemExit as exc:
+                return 1
+            if workload_manager == "manual":
+                local_runner.print_status(user, experiment_name, docker_image_list, descriptor_data, workloads_data, dbg_lvl)
+            else:
+                slurm_runner.print_status(user, experiment_name, docker_image_list, descriptor_data, workloads_data, dbg_lvl)
+            return 0
+
+        if action == "launch":
+            open_interactive_shell(user, descriptor_path, descriptor_data, workloads_data, infra_dir, dbg_lvl)
+            return 0
+
+        if action == "clean":
+            try:
+                verify_descriptor(descriptor_data, workloads_data, False, False, dbg_lvl)
+            except SystemExit as exc:
+                return 1
+            if workload_manager == "slurm":
+                slurm_runner.clean_containers(user, experiment_name, docker_image_list, dbg_lvl)
+                descriptor_root = Path(descriptor_data["root_dir"])
+                experiment_dir = descriptor_root / "simulations" / experiment_name
+                remove_tmp_run_scripts(Path(infra_dir), experiment_name, user, dbg_lvl)
+                remove_tmp_run_scripts(experiment_dir, experiment_name, user, dbg_lvl)
+            remove_docker_containers(docker_image_list, experiment_name, user, dbg_lvl)
+            return 0
+
+        # default: run simulation
+        verify_descriptor(descriptor_data, workloads_data, False, True, dbg_lvl)
+        stale_conflicts, active_conflicts = find_conflicting_containers(
+            workload_manager,
+            docker_image_list,
+            experiment_name,
+            user,
+            dbg_lvl,
+        )
+        if stale_conflicts:
+            print(f"Found existing stale containers for experiment '{experiment_name}'. Refusing to launch simulations.")
+            for location, containers in sorted(stale_conflicts.items()):
+                preview = ", ".join(containers[:3])
+                suffix = " ..." if len(containers) > 3 else ""
+                print(f"- {location}: {len(containers)} container(s) ({preview}{suffix})")
+            print("Why this happens:")
+            print("- Container names are deterministic for the same experiment/workload/config/user, so reruns reuse the same names.")
+            print("- Most failures are cleaned by traps or Docker's --rm flag, but hard failures can still leave orphans (for example: node crash/reboot, or unreachable node during cleanup).")
+            print("- Existing containers with reused names cause docker name-conflict errors and can produce misleading status logs.")
+            print(f"Run './sci --kill {experiment_name}', then retry './sci --sim {experiment_name}'.")
+            print(f"If conflicts remain (for example, containers stranded on failed/rebooted nodes), run './sci --clean {experiment_name}'.")
+            return 1
+        if active_conflicts:
+            total_active = sum(len(containers) for containers in active_conflicts.values())
+            print(
+                f"Detected {total_active} active container(s) for experiment '{experiment_name}'. "
+                "Continuing; active jobs will be skipped."
+            )
+
+        if workload_manager == "manual":
+            local_runner.run_simulation(user, descriptor_data, workloads_data, infra_dir, descriptor_path, dbg_lvl)
+        else:
+            slurm_runner.run_simulation(user, descriptor_data, workloads_data, infra_dir, descriptor_path, dbg_lvl)
+        return 0
+    except Exception as exc:
+        raise exc
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Runs scarab on local or a slurm network')
+
+    parser.add_argument('-d','--descriptor_name', required=True, help='Experiment descriptor name. Usage: -d exp.json')
+    parser.add_argument('-k','--kill', required=False, default=False, action=argparse.BooleanOptionalAction, help='Don\'t launch jobs from descriptor, kill running jobs as described in descriptor')
+    parser.add_argument('-i','--info', required=False, default=False, action=argparse.BooleanOptionalAction, help='Get info about all nodes and if they have containers for slurm workloads')
+    parser.add_argument('-l','--launch', required=False, default=False, action=argparse.BooleanOptionalAction, help='Launch a docker container on a node for the purpose of development/debugging where the environment is for the experiment described in a descriptor.')
+    parser.add_argument('-c','--clean', required=False, default=False, action=argparse.BooleanOptionalAction, help='Clean up all the docker containers related to an experiment')
+    parser.add_argument('-dbg','--debug', required=False, type=int, default=2, help='1 for errors, 2 for warnings, 3 for info')
+    parser.add_argument('-si','--scarab_infra', required=False, default=None, help='Path to scarab infra repo to launch new containers')
+
+    args = parser.parse_args()
+    descriptor_path = args.descriptor_name
+    dbg_lvl = args.debug
+    infra_dir = args.scarab_infra
+
+    action = "simulate"
+    if args.kill:
+        action = "kill"
+    elif args.info:
+        action = "info"
+    elif args.launch:
+        action = "launch"
+    elif args.clean:
+        action = "clean"
+
+    return run_simulation_command(descriptor_path, action, dbg_lvl=dbg_lvl, infra_dir=infra_dir)
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RuntimeError as exc:
+        err(str(exc), 1)
+        sys.exit(1)

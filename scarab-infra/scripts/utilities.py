@@ -1,0 +1,2917 @@
+#!/usr/bin/python3
+
+# 01/27/2025 Surim Oh | utilities.py
+
+import json
+import os
+import subprocess
+import re
+import shlex
+import shutil
+from collections import deque
+from pathlib import Path
+import importlib
+import sys
+from typing import Dict, Iterator, Optional, Tuple
+
+try:
+    import docker
+except ImportError:  # pragma: no cover - docker is optional for some commands
+    docker = None
+
+# Add the project root to sys.path for imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+import workloads.extract_top_simpoints as extract_top_simpoints
+importlib.reload(extract_top_simpoints)
+
+DEFAULT_CONDA_ENV = "scarabinfra"
+_docker_client = None
+BASE_MEMORY_BY_MODE_KEY = "base_memory_mb_by_mode"
+VALID_SIMULATION_MODES = ("memtrace", "pt", "exec")
+
+def get_docker_client():
+    global _docker_client
+    if docker is None:
+        return None
+    if _docker_client is None:
+        try:
+            _docker_client = docker.from_env()
+        except Exception:
+            _docker_client = None
+    return _docker_client
+
+# Print an error message if on right debugging level
+def err(msg: str, level: int):
+    if level >= 1:
+        print("ERR:", msg)
+
+# Print warning message if on right debugging level
+def warn(msg: str, level: int):
+    if level >= 2:
+        print("WARN:", msg)
+
+# Print info message if on right debugging level
+def info(msg: str, level: int):
+    if level >= 3:
+        print("INFO:", msg)
+
+# Print a non-warning informational message at default debug levels
+def note(msg: str, level: int):
+    if level >= 2:
+        print("INFO:", msg)
+
+
+def get_default_simulation_mode(workload_entry: dict) -> Optional[str]:
+    simulation = workload_entry.get("simulation")
+    if not isinstance(simulation, dict):
+        return None
+    prioritized = simulation.get("prioritized_mode")
+    if prioritized in VALID_SIMULATION_MODES and prioritized in simulation:
+        return prioritized
+    for candidate in VALID_SIMULATION_MODES:
+        if candidate in simulation:
+            return candidate
+    return None
+
+
+def get_mode_specific_base_memory(entry: dict, sim_mode: Optional[str], workload_entry: Optional[dict] = None):
+    if not isinstance(entry, dict):
+        return None
+
+    normalized_mode = sim_mode if sim_mode in VALID_SIMULATION_MODES else None
+    by_mode = entry.get(BASE_MEMORY_BY_MODE_KEY)
+    if isinstance(by_mode, dict):
+        if normalized_mode is not None:
+            return by_mode.get(normalized_mode)
+
+        default_mode = get_default_simulation_mode(workload_entry or entry)
+        if default_mode is not None:
+            return by_mode.get(default_mode)
+
+    return None
+
+
+def set_mode_specific_base_memory(entry: dict, sim_mode: Optional[str], base_memory_mb, workload_entry: Optional[dict] = None) -> Optional[str]:
+    if not isinstance(entry, dict):
+        return None
+
+    normalized_mode = sim_mode if sim_mode in VALID_SIMULATION_MODES else None
+    if normalized_mode is None:
+        normalized_mode = get_default_simulation_mode(workload_entry or entry)
+    if normalized_mode is None:
+        return None
+
+    by_mode = entry.get(BASE_MEMORY_BY_MODE_KEY)
+    if not isinstance(by_mode, dict):
+        by_mode = {}
+        entry[BASE_MEMORY_BY_MODE_KEY] = by_mode
+    by_mode[normalized_mode] = round(base_memory_mb)
+
+    return normalized_mode
+
+# json descriptor reader
+def read_descriptor_from_json(filename="experiment.json", dbg_lvl = 1):
+    # Read the descriptor data from a JSON file
+    try:
+        with open(filename, 'r') as json_file:
+            descriptor_data = json.load(json_file)
+        return descriptor_data
+    except FileNotFoundError:
+        err(f"File '{filename}' not found.", dbg_lvl)
+        return None
+    except json.JSONDecodeError as e:
+        err(f"Error decoding JSON in file '{filename}': {e}", dbg_lvl)
+        return None
+
+# json descriptor writer
+def write_json_descriptor(filename, descriptor_data, dbg_lvl = 1):
+    # Write the descriptor data to a JSON file
+    try:
+        with open(filename, 'w') as json_file:
+            json.dump(descriptor_data, json_file, indent=2, separators=(",", ":"))
+    except TypeError as e:
+            print(f"TypeError: {e}")
+    except UnicodeEncodeError as e:
+            print(f"UnicodeEncodeError: {e}")
+    except OverflowError as e:
+            print(f"OverflowError: {e}")
+    except ValueError as e:
+            print(f"ValueError: {e}")
+    except json.JSONDecodeError as e:
+            print(f"JSONDecodeError: {e}")
+
+def run_on_node(cmd, node=None, immediate=5, **kwargs):
+    command = list(cmd)
+    if node != None:
+        # Use fast-fail scheduling for management commands so they do not
+        # block behind busy-node resource allocation. Callers can disable the
+        # immediate flag when they want to retry and wait briefly instead.
+        command = [
+            "srun",
+            f"--nodelist={node}",
+            "--nodes=1",
+            "--ntasks=1",
+            "--cpus-per-task=1",
+        ]
+        if immediate is not None:
+            command.append(f"--immediate={immediate}")
+        command += list(cmd)
+    return subprocess.run(command, **kwargs)
+
+def validate_simulation(workloads_data, simulations, dbg_lvl = 2):
+    simulations = normalize_simulations(simulations)
+    for simulation in simulations:
+        suite = simulation["suite"]
+        subsuite = simulation["subsuite"]
+        workload = simulation["workload"]
+        cluster_id = simulation["cluster_id"]
+        sim_mode = simulation["simulation_type"]
+        sim_warmup = simulation["warmup"]
+
+        if suite == None:
+            err(f"Suite field cannot be null.", dbg_lvl)
+            exit(1)
+
+        if suite not in workloads_data.keys():
+            err(f"Suite '{suite}' is not valid.", dbg_lvl)
+            exit(1)
+
+        if subsuite != None and subsuite not in workloads_data[suite].keys():
+            err(f"Subsuite '{subsuite}' is not valid in Suite '{suite}'.", dbg_lvl);
+            exit(1)
+
+        if workload == None and cluster_id != None:
+            err(f"If you want to run all the workloads within '{suite}', empty 'workload' and 'cluster_id'.", dbg_lvl)
+            exit(1)
+
+        if workload == None:
+            if subsuite == None:
+                for subsuite_ in workloads_data[suite].keys():
+                    for workload_ in workloads_data[suite][subsuite_].keys():
+                        if not isinstance(workloads_data[suite][subsuite_][workload_], dict):
+                            continue
+                        predef_mode = workloads_data[suite][subsuite_][workload_]["simulation"]["prioritized_mode"]
+                        sim_mode_ = sim_mode
+                        if sim_mode_ == None:
+                            sim_mode_ = predef_mode
+                        if sim_mode_ not in workloads_data[suite][subsuite_][workload_]["simulation"].keys():
+                            err(f"{sim_mode_} is not a valid simulation mode for workload {workload_}.", dbg_lvl)
+                            exit(1)
+                        if sim_warmup is not None and sim_mode_ == "memtrace" and sim_warmup > workloads_data[suite][subsuite_][workload_]["simulation"]["memtrace"]["warmup"]:
+                            err(f"{sim_warmup} is not a valid warmup for workload {workload_} and {sim_mode_}.", dbg_lvl)
+                            exit(1)
+
+            else:
+                for workload_ in workloads_data[suite][subsuite].keys():
+                    if not isinstance(workloads_data[suite][subsuite][workload_], dict):
+                        continue
+                    predef_mode = workloads_data[suite][subsuite][workload_]["simulation"]["prioritized_mode"]
+                    sim_mode_ = sim_mode
+                    if sim_mode_ == None:
+                        sim_mode_ = predef_mode
+                    if sim_mode_ not in workloads_data[suite][subsuite][workload_]["simulation"].keys():
+                        err(f"{sim_mode_} is not a valid simulation mode for workload {workload_}.", dbg_lvl)
+                        exit(1)
+                    if sim_warmup is not None and sim_mode_ == "memtrace" and sim_warmup > workloads_data[suite][subsuite][workload_]["simulation"]["memtrace"]["warmup"]:
+                        err(f"{sim_warmup} is not a valid warmup for workload {workload_} and {sim_mode_}.", dbg_lvl)
+                        exit(1)
+        else:
+            if subsuite == None:
+                found = False
+                for subsuite_ in workloads_data[suite].keys():
+                    if workload not in workloads_data[suite][subsuite_].keys():
+                        continue
+                    found = True
+                    predef_mode = workloads_data[suite][subsuite_][workload]["simulation"]["prioritized_mode"]
+                    sim_mode_ = sim_mode
+                    if sim_mode_ == None:
+                        sim_mode_ = predef_mode
+                    if sim_mode_ not in workloads_data[suite][subsuite_][workload]["simulation"].keys():
+                        err(f"{sim_mode_} is not a valid simulation mode for workload {workload}.", dbg_lvl)
+                        exit(1)
+                    if sim_warmup is not None and sim_mode_ == "memtrace" and sim_warmup > workloads_data[suite][subsuite_][workload]["simulation"]["memtrace"]["warmup"]:
+                        err(f"{sim_warmup} is not a valid warmup for workload {workload} and {sim_mode_}.", dbg_lvl)
+                        exit(1)
+                if not found:
+                    err(f"Workload '{workload}' is not valid in suite {suite}", dbg_lvl)
+                    exit(1)
+            else:
+                if workload not in workloads_data[suite][subsuite].keys():
+                    err(f"Workload '{workload}' is not valid in suite {suite} and subsuite {subsuite}.", dbg_lvl)
+                    exit(1)
+                predef_mode = workloads_data[suite][subsuite][workload]["simulation"]["prioritized_mode"]
+                sim_mode_ = sim_mode
+                if sim_mode_ == None:
+                    sim_mode_ = predef_mode
+                if sim_mode_ not in workloads_data[suite][subsuite][workload]["simulation"].keys():
+                    err(f"{sim_mode_} is not a valid simulation mode for workload {workload}.", dbg_lvl)
+                    exit(1)
+                if sim_warmup is not None and sim_mode_ == "memtrace" and sim_warmup > workloads_data[suite][subsuite][workload]["simulation"]["memtrace"]["warmup"]:
+                    err(f"{sim_warmup} is not a valid warmup for workload {workload} and {sim_mode_}.", dbg_lvl)
+                    exit(1)
+
+            if cluster_id != None:
+                if "simpoints" not in workloads_data[suite][subsuite][workload].keys():
+                    err(f"Simpoints are not available for workload {workload}. Choose 'null' for cluster id.", dbg_lvl)
+                    exit(1)
+                if cluster_id > 0:
+                    found = False
+                    for simpoint in workloads_data[suite][subsuite][workload]["simpoints"]:
+                        if cluster_id == simpoint["cluster_id"]:
+                            found = True
+                            break
+                    if not found:
+                        err(f"Cluster ID {cluster_id} is not valid for workload '{workload}'.", dbg_lvl)
+                        exit(1)
+                elif cluster_id < 0:
+                    err(f"Cluster ID should be greater than 0. {cluster_id} is not valid.", dbg_lvl)
+                    exit(1)
+
+        print(f"[{suite}, {subsuite}, {workload}, {cluster_id}, {sim_mode}] is a valid simulation option.")
+
+
+import os
+import fcntl
+import stat
+import errno
+import time
+from contextlib import contextmanager
+
+@contextmanager
+def file_lock(lock_path):
+    """
+    Simple blocking file lock using fcntl.flock.
+    Ensures only one process at a time holds the lock.
+    """
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fd = None
+    for _ in range(50):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+            break
+        except OSError as e:
+            if e.errno == errno.EACCES:
+                # Another process may have created this file with restrictive
+                # permissions and has not yet relaxed them.
+                time.sleep(0.1)
+                continue
+            raise
+    if fd is None:
+        raise PermissionError(f"Timed out opening lock file: {lock_path}")
+    try:
+        # Ensure other users can use the same lock file.
+        try:
+            os.fchmod(
+                fd,
+                stat.S_IRUSR
+                | stat.S_IWUSR
+                | stat.S_IRGRP
+                | stat.S_IWGRP
+                | stat.S_IROTH
+                | stat.S_IWOTH,
+            )
+        except OSError as e:
+            # If this process does not own the file, chmod may be denied.
+            if e.errno not in (errno.EPERM, errno.EACCES):
+                raise
+        fcntl.flock(fd, fcntl.LOCK_EX)  # blocks until lock acquired
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+# Prepare the docker image on each node
+# Inputs:   docker_prefix - docker image name
+#           image_tag - image name with the tag to build
+#           latest_image_tag - the latest pre-built image name with the tag
+#           diff_output - diff of two git hashes in the directories that change the docker image
+# Output: list of nodes where the docker image is ready
+def prepare_docker_image(docker_prefix, image_tag, dbg_lvl=1):
+    # Fast path: image already exists → nothing to do
+    if image_exist(image_tag):
+        return
+
+    # Derive a lock path that is unique per image tag
+    safe_tag = image_tag.replace("/", "_").replace(":", "_")
+    lock_path = f"/tmp/docker_build_{safe_tag}.lock"
+
+    with file_lock(lock_path):
+        # Once we hold the lock, re-check: another job may have built the image already.
+        if image_exist(image_tag):
+            return
+
+        try:
+            sci_path = os.path.join(project_root, "sci")
+            print(f"Invoking {sci_path} --build-image {docker_prefix}")
+            # Ensure stdout is streamed for visibility when running locally.
+            subprocess.run([sci_path, "--build-image", docker_prefix], check=True)
+        except subprocess.CalledProcessError as e:
+            err(f"sci --build-image failed with return code {e.returncode}", dbg_lvl)
+            failure_stdout = getattr(e, "stdout", None)
+            if failure_stdout:
+                err(failure_stdout.decode(), dbg_lvl)
+
+            # After failure, check one more time: maybe another process succeeded
+            # in the meantime (if you ever relax the lock to non-blocking).
+            if not image_exist(image_tag):
+                err(f"Still couldn't find image {image_tag} after attempting to build.", dbg_lvl)
+                exit(1)
+
+# Locally builds scarab using docker. No caching or skipping logic
+def build_scarab_binary(user, scarab_path, scarab_build, docker_home, docker_prefix, githash, infra_dir, dbg_lvl=1, stream_build=False):
+    local_uid = os.getuid()
+    local_gid = os.getgid()
+
+    exception = None
+
+    scarab_bin = f"{scarab_path}/src/build/{scarab_build}/scarab"
+    info(f"Scarab binary at '{scarab_bin}', building it first, please wait...", dbg_lvl)
+    docker_container_name = f"{docker_prefix}_{user}_scarab_build"
+    try:
+        subprocess.run(
+                ["docker", "run", "-e", f"user_id={local_uid}",
+                 "-e", f"group_id={local_gid}",
+                 "-e", f"username={user}",
+                 "-dit", "--name", f"{docker_container_name}",
+                 "--mount", f"type=bind,source={docker_home},target=/home/{user},readonly=false",
+                 "--mount", f"type=bind,source={scarab_path},target=/scarab,readonly=false",
+                 f"{docker_prefix}:{githash}", "/bin/bash"], check=True, capture_output=True, text=True)
+        subprocess.run(
+                ["docker", "cp", f"{infra_dir}/common/scripts/root_entrypoint.sh", f"{docker_container_name}:/usr/local/bin"],
+                check=True, capture_output=True, text=True)
+        subprocess.run(
+                ["docker", "cp", f"{infra_dir}/common/scripts/user_entrypoint.sh", f"{docker_container_name}:/usr/local/bin"],
+                check=True, capture_output=True, text=True)
+        if os.path.isfile(f"{infra_dir}/workloads/{docker_prefix}/workload_root_entrypoint.sh"):
+            subprocess.run(
+                    ["docker", "cp", f"{infra_dir}/workloads/{docker_prefix}/workload_root_entrypoint.sh", f"{docker_container_name}:/usr/local/bin"],
+                    check=True, capture_output=True, text=True)
+        if os.path.isfile(f"{infra_dir}/workloads/{docker_prefix}/workload_user_entrypoint.sh"):
+            subprocess.run(
+                    ["docker", "cp", f"{infra_dir}/workloads/{docker_prefix}/workload_user_entrypoint.sh", f"{docker_container_name}:/usr/local/bin"],
+                    check=True, capture_output=True, text=True)
+
+        subprocess.run(
+                ["docker", "exec", "--privileged", f"{docker_container_name}", "/bin/bash", "-c", "\'/usr/local/bin/root_entrypoint.sh\'"],
+                check=True, capture_output=True, text=True)
+
+        info(f"Building scarab with image {githash}...", dbg_lvl)
+        build_cmd = [
+                "docker",
+                    "exec",
+                    f"--user={user}",
+                    f"--workdir=/home/{user}",
+                    f"{docker_container_name}",
+                    "/bin/bash",
+                    "-c",
+                    f"cd /scarab/src && make {scarab_build} -j{os.cpu_count()}"
+            ]
+
+        if stream_build:
+            build_result = subprocess.run(build_cmd, text=True)
+        else:
+            build_result = subprocess.run(build_cmd, capture_output=True, text=True)
+
+        if build_result.returncode != 0:
+            if stream_build:
+                exception = RuntimeError("Scarab build returned with non-zero code")
+                err("Scarab build failed. See output above for details.", dbg_lvl)
+            else:
+                exception = RuntimeError("Scarab build returned with non-zero code")
+                err(f"Build stdout: {build_result.stdout}", dbg_lvl)
+                err(f"Build stderr: {build_result.stderr}", dbg_lvl)
+
+    except Exception as e:
+        exception = e
+    finally:
+        # Always clean up build container
+        subprocess.run(["docker", "rm", "-f", f"{docker_container_name}"], check=True, capture_output=True, text=True)
+
+    if exception != None:
+        raise exception
+
+
+def lint_scarab_binary(user, scarab_path, scarab_build, docker_home, docker_prefix, githash, infra_dir, dbg_lvl=1):
+    """Run clang-tidy inside the scarab build container against the compile DB
+    produced by the latest scarab build.
+
+    Enabled checks, excluded directories, and the clang-tidy version itself
+    are defined here so every caller (CI, local dev) sees identical results.
+
+    Prerequisites:
+    - The caller has already built scarab (e.g. via build_scarab_binary), so
+      {scarab_path}/src/build/{scarab_build}/compile_commands.json exists.
+      This is guaranteed when src/CMakeLists.txt contains
+      `set(CMAKE_EXPORT_COMPILE_COMMANDS ON)`.
+
+    Returns: 0 on clean, 1 on any finding or infra failure.
+    """
+    local_uid = os.getuid()
+    local_gid = os.getgid()
+    build_mode = scarab_build if scarab_build else "opt"
+    docker_container_name = f"{docker_prefix}_{user}_scarab_lint"
+
+    # Keep the enabled check set narrow. Expand intentionally by editing this
+    # list; every consumer of --lint-scarab picks up the change automatically.
+    checks = "-*,cppcoreguidelines-pro-type-member-init"
+    # Directories/files we never lint. We keep this list as narrow as
+    # possible so that scarab-owned code is always checked.
+    #
+    #   - deps, ramulator: vendored third-party sources.
+    #   - pin/pin_exec, pin/pin_trace: Intel-PIN tools built with the PIN
+    #     toolchain. They have their own CMakeLists.txt with nonstandard
+    #     flags (pin.H etc.) and are NOT part of scarab's main
+    #     compile_commands.json.
+    #   - pin/pin_lib/decoder.{cc,h}: the one file in pin_lib that is also
+    #     PIN-only (it #include "pin.H"). The rest of pin_lib IS in the main
+    #     compile DB and is linted.
+    #   - test: standalone gtest Makefile-driven tests; not in the CMake
+    #     target, so they don't appear in compile_commands.json and
+    #     clang-tidy would flag every #include <gtest/gtest.h> as missing.
+    exclude_re = (
+        r"^(deps|ramulator|pin/pin_exec|pin/pin_trace|test)/"
+        r"|^pin/pin_lib/decoder\.(cc|h)$"
+    )
+    # Positive-list of scarab-owned top-level dirs that we DO want header
+    # diagnostics from. We use a positive list rather than a negative one
+    # because clang-tidy 18 does not yet support --exclude-header-filter
+    # (added in clang-tidy 19) and llvm::Regex lacks negative lookahead.
+    #
+    # Matches either:
+    #   /scarab/src/<allowed_subdir>/...   (headers inside scarab source trees)
+    #   /scarab/src/pin/pin_lib/...        (scarab-authored PIN glue; pin_exec/
+    #                                       is the PIN tool and stays excluded)
+    #   /scarab/src/<top_level_file>       (headers directly under src/, e.g.
+    #                                       decoupled_frontend.h, ft.h, …)
+    #
+    # If a new top-level source dir is added to scarab, append it here.
+    scarab_owned_dirs = "bp|confidence|debug|dvfs|frontend|globals|isa|libs|memory|power|prefetcher|support"
+    header_filter_re = (
+        rf"^/scarab/src/({scarab_owned_dirs})/"
+        r"|^/scarab/src/pin/pin_lib/"
+        r"|^/scarab/src/[^/]+$"
+    )
+    # Defense-in-depth: even though we positive-filter via --header-filter,
+    # also drop any vendored-tree path (or PIN-only pin_lib/decoder.h) that
+    # somehow makes it into the log before the pass/fail grep.
+    header_exclude_re = (
+        r"/scarab/src/(deps|ramulator|pin/pin_exec|pin/pin_trace|test)/"
+        r"|/scarab/src/pin/pin_lib/decoder\.h"
+    )
+
+    lint_script = (
+        "set -o pipefail\n"
+        "cd /scarab/src\n"
+        "\n"
+        "# Fail fast if the image doesn't have clang-tidy: otherwise xargs\n"
+        "# silently emits 'command not found' for every TU and the grep for\n"
+        "# findings yields zero results, making the step appear green when in\n"
+        "# reality no linting ran.\n"
+        "if ! command -v clang-tidy >/dev/null 2>&1; then\n"
+        "  echo 'ERROR: clang-tidy not available in this container image.' >&2\n"
+        "  echo 'Rebuild the scarab-infra docker image (e.g. remove the cached' >&2\n"
+        "  echo 'tag and rerun --build-scarab) so the Dockerfile.common changes' >&2\n"
+        "  echo 'that install clang-tidy-18 take effect.' >&2\n"
+        "  exit 127\n"
+        "fi\n"
+        "\n"
+        f"BUILD_DIR=build/{build_mode}\n"
+        "if [ ! -f \"$BUILD_DIR/compile_commands.json\" ]; then\n"
+        "  echo \"ERROR: $BUILD_DIR/compile_commands.json missing.\" >&2\n"
+        "  echo 'Run `./sci --build-scarab <descriptor>` first; CMakeLists.txt has' >&2\n"
+        "  echo 'CMAKE_EXPORT_COMPILE_COMMANDS ON so any build emits the compile DB.' >&2\n"
+        "  exit 2\n"
+        "fi\n"
+        "\n"
+        "LOG=/tmp/clang-tidy.log\n"
+        "FINDINGS=/tmp/clang-tidy-findings.txt\n"
+        ": > \"$LOG\"\n"
+        "\n"
+        f"mapfile -t FILES < <(git ls-files '*.cc' | grep -vE '{exclude_re}' | sort)\n"
+        "echo \"Linting ${#FILES[@]} translation units with $(clang-tidy --version | head -n1)...\"\n"
+        "\n"
+        "printf '%s\\n' \"${FILES[@]}\" \\\n"
+        "  | xargs -P \"$(nproc)\" -I{} -n 1 \\\n"
+        "      clang-tidy \\\n"
+        "        -p \"$BUILD_DIR\" \\\n"
+        "        -quiet \\\n"
+        f"        -checks='{checks}' \\\n"
+        # Positive-list scarab-owned headers only. Headers transitively
+        # pulled in from deps/ / ramulator/ / pin/ / test/ will not match
+        # this regex and clang-tidy will therefore suppress diagnostics
+        # that originate inside them (diagnostics from the main TU file
+        # itself are always shown regardless of --header-filter).
+        f"        --header-filter='{header_filter_re}' \\\n"
+        "        {} 2>&1 | tee -a \"$LOG\" || true\n"
+        "\n"
+        # Post-filter on findings is (mostly) redundant with --header-filter
+        # now, but we keep it as defense-in-depth in case a diagnostic from
+        # a vendored tree slips through (e.g. if a new top-level dir gets
+        # added to scarab_owned_dirs and someone forgets to update the list).
+        "{ grep -E 'warning:.*\\[cppcoreguidelines-pro-type-member-init\\]' \"$LOG\" \\\n"
+        f"    | grep -vE '{header_exclude_re}' \\\n"
+        "    | sort -u; } > \"$FINDINGS\" || true\n"
+        "\n"
+        "echo '=== member-init findings (post-filter) ==='\n"
+        "if [ -s \"$FINDINGS\" ]; then\n"
+        "  cat \"$FINDINGS\"\n"
+        "  echo '=========================================='\n"
+        "  exit 1\n"
+        "fi\n"
+        "echo '<none>'\n"
+        "echo '=========================================='\n"
+        "echo 'clang-tidy clean.'\n"
+    )
+
+    # Preflight: if the image isn't present we want a clear message pointing
+    # at --build-scarab, not a cryptic `docker run` failure. We deliberately
+    # do NOT rebuild the image here: --lint-scarab is supposed to be a fast
+    # linter, not a stealth image builder.
+    image_ref = f"{docker_prefix}:{githash}"
+    if not image_exist(image_ref):
+        raise RuntimeError(
+            f"Docker image '{image_ref}' not found locally. "
+            "Run `./sci --build-scarab <descriptor>` first to build scarab "
+            "and prepare this image."
+        )
+
+    info(f"Linting scarab with image {image_ref}...", dbg_lvl)
+    exception = None
+    try:
+        subprocess.run(
+            ["docker", "run",
+             "-e", f"user_id={local_uid}",
+             "-e", f"group_id={local_gid}",
+             "-e", f"username={user}",
+             "-dit", "--name", f"{docker_container_name}",
+             "--mount", f"type=bind,source={docker_home},target=/home/{user},readonly=false",
+             "--mount", f"type=bind,source={scarab_path},target=/scarab,readonly=false",
+             image_ref, "/bin/bash"],
+            check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["docker", "cp", f"{infra_dir}/common/scripts/root_entrypoint.sh",
+             f"{docker_container_name}:/usr/local/bin"],
+            check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["docker", "cp", f"{infra_dir}/common/scripts/user_entrypoint.sh",
+             f"{docker_container_name}:/usr/local/bin"],
+            check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["docker", "exec", "--privileged", f"{docker_container_name}",
+             "/bin/bash", "-c", "/usr/local/bin/root_entrypoint.sh"],
+            check=True, capture_output=True, text=True)
+
+        # Stream output so the step log reflects progress in real time.
+        lint_result = subprocess.run(
+            ["docker", "exec",
+             f"--user={user}", f"--workdir=/home/{user}",
+             f"{docker_container_name}",
+             "/bin/bash", "-c", lint_script],
+            text=True)
+        if lint_result.returncode != 0:
+            exception = RuntimeError(
+                f"clang-tidy lint failed (exit {lint_result.returncode})"
+            )
+    except Exception as e:
+        exception = e
+    finally:
+        subprocess.run(
+            ["docker", "rm", "-f", f"{docker_container_name}"],
+            check=False, capture_output=True, text=True)
+
+    if exception is not None:
+        raise exception
+
+
+def _scarab_repo_clean(scarab_path: str) -> bool:
+    try:
+        status_output = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=scarab_path, text=True
+        )
+    except subprocess.CalledProcessError:
+        return False
+    dirty = [
+        line for line in status_output.splitlines() if line and not line.startswith("??")
+    ]
+    return len(dirty) == 0
+
+
+def _current_git_ref(scarab_path: str) -> str:
+    branch_name = None
+    try:
+        branch_name = (
+            subprocess.check_output(
+                ["git", "symbolic-ref", "--short", "HEAD"],
+                cwd=scarab_path,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            .strip()
+        )
+    except subprocess.CalledProcessError:
+        branch_name = None
+
+    commit_hash = (
+        subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=scarab_path, text=True)
+        .strip()
+    )
+    return branch_name if branch_name else commit_hash
+
+
+def _stash_ref_for_message(scarab_path: str, message: str) -> Optional[str]:
+    try:
+        stash_list = subprocess.check_output(
+            ["git", "stash", "list", "--format=%gd\t%gs"],
+            cwd=scarab_path,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+
+    for line in stash_list.splitlines():
+        ref, _, subject = line.partition("\t")
+        if subject == message:
+            return ref.strip() or None
+    return None
+
+
+@contextmanager
+def _temporary_scarab_checkout(scarab_path: str, target_ref: str, dbg_lvl: int):
+    original_ref = _current_git_ref(scarab_path)
+    stash_ref = None
+    stash_message = f"sci-temp-scarab-build-{os.getpid()}-{int(time.time())}"
+
+    if not _scarab_repo_clean(scarab_path):
+        warn(
+            "Scarab repo has uncommitted changes; stashing them temporarily to build a hash-pinned binary.",
+            dbg_lvl,
+        )
+        try:
+            subprocess.run(
+                ["git", "stash", "push", "--include-untracked", "-m", stash_message],
+                cwd=scarab_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            err(
+                f"Failed to stash local scarab changes before checkout: {exc.stderr or exc.stdout or exc}",
+                dbg_lvl,
+            )
+            raise RuntimeError("Unable to stash local scarab changes") from exc
+        stash_ref = _stash_ref_for_message(scarab_path, stash_message)
+
+    try:
+        subprocess.run(
+            ["git", "checkout", target_ref],
+            cwd=scarab_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        yield
+    finally:
+        checkout_error = None
+        try:
+            subprocess.run(
+                ["git", "checkout", original_ref],
+                cwd=scarab_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            checkout_error = exc
+
+        if stash_ref:
+            try:
+                subprocess.run(
+                    ["git", "stash", "pop", stash_ref],
+                    cwd=scarab_path,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                err(
+                    "Failed to restore stashed scarab changes after building a hash-pinned binary. "
+                    f"Your changes remain in {stash_ref}.",
+                    dbg_lvl,
+                )
+                raise RuntimeError(
+                    f"Unable to restore stashed scarab changes automatically; recover them with `git stash pop {stash_ref}`"
+                ) from exc
+
+        if checkout_error is not None:
+            err(
+                f"Failed to restore scarab repository to {original_ref}: "
+                f"{checkout_error.stderr or checkout_error.stdout or checkout_error}",
+                dbg_lvl,
+            )
+            raise RuntimeError(f"Unable to restore scarab repo to {original_ref}") from checkout_error
+
+
+def _cache_bin_name(bin_name: str, build_mode: str) -> str:
+    if bin_name.endswith((".opt", ".dbg")):
+        return bin_name
+    if bin_name.startswith("scarab_"):
+        return f"{bin_name}.{build_mode}"
+    return bin_name
+
+
+def _interactive_binary_status(
+    infra_dir: str,
+    scarab_path: str,
+    scarab_githash: str,
+    build_mode: str,
+) -> Tuple[bool, Optional[str], str, str]:
+    cache_name = _cache_bin_name("scarab_current", build_mode)
+    current_scarab_bin = f"{infra_dir}/scarab_builds/{cache_name}"
+    repo_scarab_bin = f"{scarab_path}/src/build/{build_mode}/scarab"
+
+    try:
+        status_output = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=scarab_path,
+            text=True,
+        )
+        dirty = any(
+            line for line in status_output.splitlines() if line and not line.startswith("??")
+        )
+    except Exception as exc:
+        return False, f"could not check scarab git status: {exc}", current_scarab_bin, repo_scarab_bin
+
+    if dirty:
+        return (
+            False,
+            "scarab repo has tracked uncommitted changes, so current binaries may be stale",
+            current_scarab_bin,
+            repo_scarab_bin,
+        )
+
+    if not os.path.isfile(repo_scarab_bin):
+        return (
+            False,
+            f"repo binary not found at {repo_scarab_bin}",
+            current_scarab_bin,
+            repo_scarab_bin,
+        )
+
+    if not os.path.isfile(current_scarab_bin):
+        return (
+            False,
+            f"cached scarab_current not found at {current_scarab_bin}",
+            current_scarab_bin,
+            repo_scarab_bin,
+        )
+
+    try:
+        result = subprocess.run(
+            ["diff", current_scarab_bin, repo_scarab_bin],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        return (
+            False,
+            f"could not compare cached and repo binaries: {exc}",
+            current_scarab_bin,
+            repo_scarab_bin,
+        )
+
+    if result.returncode != 0:
+        if result.returncode == 1:
+            return (
+                False,
+                "cached scarab_current differs from repo binary",
+                current_scarab_bin,
+                repo_scarab_bin,
+            )
+        return (
+            False,
+            f"could not compare cached and repo binaries (diff exit {result.returncode})",
+            current_scarab_bin,
+            repo_scarab_bin,
+        )
+
+    try:
+        if not os.path.islink(current_scarab_bin):
+            return (
+                False,
+                "cached scarab_current is not a symlink to a hash-specific binary",
+                current_scarab_bin,
+                repo_scarab_bin,
+            )
+        link_target = os.readlink(current_scarab_bin)
+    except OSError as exc:
+        return (
+            False,
+            f"could not inspect cached scarab_current symlink: {exc}",
+            current_scarab_bin,
+            repo_scarab_bin,
+        )
+
+    if scarab_githash not in link_target:
+        return (
+            False,
+            "cached scarab_current symlink does not match current git hash",
+            current_scarab_bin,
+            repo_scarab_bin,
+        )
+
+    return True, None, current_scarab_bin, repo_scarab_bin
+
+
+def _warn_interactive_binary_statuses(
+    infra_dir: str,
+    scarab_path: str,
+    scarab_githash: str,
+    dbg_lvl: int,
+    rebuild_hint: Optional[str] = None,
+) -> None:
+    for build_mode in ("opt", "dbg"):
+        is_current, reason, current_scarab_bin, repo_scarab_bin = _interactive_binary_status(
+            infra_dir,
+            scarab_path,
+            scarab_githash,
+            build_mode,
+        )
+        if is_current:
+            info(
+                f"Interactive mode: up-to-date {build_mode} Scarab binary available.",
+                dbg_lvl,
+            )
+            continue
+        rebuild_note = ""
+        if rebuild_hint:
+            rebuild_note = (
+                f" Rebuild with: {rebuild_hint} "
+                f"(with `scarab_build` set to `{build_mode}` in the descriptor)."
+            )
+        warn(
+            "Interactive mode skips rebuilding; "
+            f"no up-to-date {build_mode} Scarab binary found ({reason}). "
+            f"cache={current_scarab_bin}, repo={repo_scarab_bin}.{rebuild_note}",
+            dbg_lvl,
+        )
+
+
+def _prompt_kill_processes_and_exit(dbg_lvl: int) -> None:
+    prompt = "Uncommitted changes detected in scarab repository. Do you want to kill these processes? [y/N]: "
+    response = ""
+    try:
+        if sys.stdin.isatty():
+            response = input(prompt).strip().lower()
+    except Exception:
+        response = ""
+
+    if response in {"y", "yes"}:
+        warn("User chose to kill processes; exiting current job.", dbg_lvl)
+    else:
+        warn("Leaving processes running; exiting current job.", dbg_lvl)
+    sys.exit(1)
+
+
+def _build_missing_scarab_version(
+    bin_name: str,
+    target_hash: str,
+    user: str,
+    scarab_path: str,
+    scarab_build: Optional[str],
+    docker_home: str,
+    docker_prefix: str,
+    githash: str,
+    infra_dir: str,
+    dbg_lvl: int,
+) -> None:
+    build_mode = scarab_build if scarab_build else "opt"
+    warn(
+        f"Missing {bin_name}; checking out {target_hash} to build ({build_mode}) and cache it.",
+        dbg_lvl,
+    )
+    try:
+        with _temporary_scarab_checkout(scarab_path, target_hash, dbg_lvl):
+            build_scarab_binary(
+                user,
+                scarab_path,
+                build_mode,
+                docker_home,
+                docker_prefix,
+                githash,
+                infra_dir,
+                dbg_lvl=dbg_lvl,
+                stream_build=True,
+            )
+            built_bin = Path(scarab_path) / "src" / "build" / build_mode / "scarab"
+            if not built_bin.is_file():
+                raise RuntimeError(f"Expected scarab binary at {built_bin} after build.")
+            cache_name = _cache_bin_name(bin_name, build_mode)
+            dest = Path(infra_dir) / "scarab_builds" / cache_name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(built_bin, dest)
+            info(f"Cached new scarab binary at {dest}", dbg_lvl)
+            
+            built_pin_exec = Path(scarab_path) / "src" / "pin" / "pin_exec" / "obj-intel64" / "pin_exec.so"
+            if built_pin_exec.is_file():
+                pin_cache_name = _cache_bin_name(f"pin_exec_{bin_name}", build_mode)
+                pin_dest = Path(infra_dir) / "scarab_builds" / pin_cache_name
+                shutil.copy2(built_pin_exec, pin_dest)
+            info(f"Cached new pin_exec binary at {pin_dest}", dbg_lvl)
+    except subprocess.CalledProcessError as exc:
+        err(
+            f"Failed to checkout {target_hash} in scarab repository: {exc.stderr or exc.stdout or exc}",
+            dbg_lvl,
+        )
+        raise RuntimeError(f"Unable to checkout {target_hash} in scarab repo") from exc
+    except Exception:
+        raise
+
+# Wrapper function that handles rebuilding scarab if needed, and caching
+def rebuild_scarab(infra_dir, scarab_path, user, docker_home, docker_prefix, githash, scarab_githash, scarab_build, stream_build=False, dbg_lvl=1):
+    build_mode = scarab_build if scarab_build else "opt"
+    current_cache_name = _cache_bin_name("scarab_current", build_mode)
+    current_scarab_bin = f"{infra_dir}/scarab_builds/{current_cache_name}"
+    force_rebuild = False
+    rebuild_reasons = []
+    try:
+        status_output = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=scarab_path,
+            text=True,
+        )
+        dirty = any(
+            line for line in status_output.splitlines() if line and not line.startswith("??")
+        )
+        if dirty:
+            info("Scarab repo has uncommitted changes; rebuilding.", dbg_lvl)
+            force_rebuild = True
+            rebuild_reasons.append("scarab repo has uncommitted changes")
+    except Exception as exc:
+        warn(f"Unable to check scarab git status: {exc}; rebuilding.", dbg_lvl)
+        force_rebuild = True
+        rebuild_reasons.append("unable to check scarab git status")
+
+
+    # Suitable binary found
+    if os.path.isfile(current_scarab_bin) and not force_rebuild:
+        scarab_bin = f"{scarab_path}/src/build/{build_mode}/scarab"
+        if os.path.isfile(scarab_bin):
+            try:
+                result = subprocess.run(
+                    ["diff", current_scarab_bin, scarab_bin],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                diff_matches = result.returncode == 0
+
+                hash_tag_matches = True
+                try:
+                    if os.path.islink(current_scarab_bin):
+                        link_target = os.readlink(current_scarab_bin)
+                        hash_tag_matches = scarab_githash in link_target
+                    else:
+                        hash_tag_matches = False
+                except OSError:
+                    hash_tag_matches = False
+
+                if diff_matches and hash_tag_matches:
+                    print("Found recent Scarab binary, no build required")
+                    return
+                if result.returncode == 1 or not hash_tag_matches:
+                    info("Cached scarab_current differs from repo binary; rebuilding.", dbg_lvl)
+                    if result.returncode == 1:
+                        rebuild_reasons.append("cached scarab_current differs from repo binary")
+                    if not hash_tag_matches:
+                        rebuild_reasons.append("cached scarab_current symlink does not match current git hash")
+                else:
+                    warn(
+                        f"Could not compare cached vs repo scarab binary (diff exit {result.returncode}); rebuilding.",
+                        dbg_lvl,
+                    )
+                    rebuild_reasons.append(f"could not compare cached vs repo binary (diff exit {result.returncode})")
+            except Exception as exc:
+                warn(f"Could not compare cached vs repo scarab binary: {exc}; rebuilding.", dbg_lvl)
+                rebuild_reasons.append(f"could not compare cached vs repo binary: {exc}")
+        else:
+            warn(f"Scarab repo binary not found at {scarab_bin}; rebuilding.", dbg_lvl)
+            rebuild_reasons.append(f"scarab repo binary not found at {scarab_bin}")
+    elif not os.path.isfile(current_scarab_bin):
+        rebuild_reasons.append("no cached scarab_current for this build mode")
+
+    if rebuild_reasons:
+        note("Rebuild reason(s): " + "; ".join(dict.fromkeys(rebuild_reasons)), dbg_lvl)
+    print("Rebuilding Scarab binary...")
+    scarab_bin = f"{scarab_path}/src/build/{build_mode}/scarab"
+
+    # Build and copy to cache
+    try:
+        build_scarab_binary(
+            user,
+            scarab_path,
+            build_mode,
+            docker_home,
+            docker_prefix,
+            githash,
+            infra_dir,
+            dbg_lvl=dbg_lvl,
+            stream_build=stream_build,
+        )
+
+        if not os.path.isfile(scarab_bin):
+            err("Scarab not found after building", dbg_lvl)
+            raise RuntimeError(f"Scarab binary not found at {scarab_bin} after build!")
+
+        # Name with git hash, with index for different iterations
+        build_differs = False
+        try:
+            info(f"diff {current_scarab_bin} {scarab_bin}", dbg_lvl)
+            subprocess.check_output(f"diff {current_scarab_bin} {scarab_bin}", shell=True, text=True)
+        except subprocess.CalledProcessError:
+            info("Caught exception caused by difference between cached current binary and build result", dbg_lvl)
+            build_differs = True
+        except FileNotFoundError:
+            build_differs = True
+
+        def githash_candidates():
+            try:
+                scarab_binaries = os.listdir(f"{infra_dir}/scarab_builds")
+            except OSError:
+                scarab_binaries = []
+            pattern = re.compile(rf"^scarab_{scarab_githash}(?:_(\d+))?\.{build_mode}$")
+            candidates = []
+            indices = []
+            for name in scarab_binaries:
+                match = pattern.match(name)
+                if not match:
+                    continue
+                candidates.append(name)
+                if match.group(1) is not None:
+                    indices.append(int(match.group(1)))
+            return candidates, indices
+
+        if not build_differs:
+            info(f"Current scarab binary is the same as the cached version. Not updating cache.", dbg_lvl)
+
+            current_path = Path(current_scarab_bin)
+            if current_path.exists() and not current_path.is_symlink():
+                # Ensure scarab_current is a symlink to a hash-specific binary for traceability.
+                current_githash_binaries, current_indicies = githash_candidates()
+                if current_githash_binaries == []:
+                    githash_name = _cache_bin_name(f"scarab_{scarab_githash}_0", build_mode)
+                    githash_scarab_bin = f"{infra_dir}/scarab_builds/{githash_name}"
+                    shutil.copy2(scarab_bin, githash_scarab_bin)
+                    pin_exec_src = f"{scarab_path}/src/pin/pin_exec/obj-intel64/pin_exec.so"
+                    if os.path.isfile(pin_exec_src):
+                        pin_cache_name = _cache_bin_name(f"pin_exec_scarab_{scarab_githash}_0", build_mode)
+                        shutil.copy2(pin_exec_src, f"{infra_dir}/scarab_builds/{pin_cache_name}")
+                elif not current_indicies:
+                    githash_name = _cache_bin_name(f"scarab_{scarab_githash}", build_mode)
+                    githash_scarab_bin = f"{infra_dir}/scarab_builds/{githash_name}"
+                else:
+                    githash_name = _cache_bin_name(
+                        f"scarab_{scarab_githash}_{max(current_indicies)}",
+                        build_mode,
+                    )
+                    githash_scarab_bin = f"{infra_dir}/scarab_builds/{githash_name}"
+
+                current_path.unlink()
+                current_path.symlink_to(Path(githash_scarab_bin).name)
+                
+                pin_current_name = _cache_bin_name("pin_exec_scarab_current", build_mode)
+                pin_current_path = Path(f"{infra_dir}/scarab_builds/{pin_current_name}")
+                pin_githash_name = githash_name.replace("scarab_", "pin_exec_scarab_", 1)
+                if Path(f"{infra_dir}/scarab_builds/{pin_githash_name}").exists():
+                    if pin_current_path.exists() or pin_current_path.is_symlink():
+                        pin_current_path.unlink()
+                    pin_current_path.symlink_to(pin_githash_name)
+        else:
+            info(f"Current scarab binary differs from cached version. Updating cache...", dbg_lvl)
+
+            # Figure out index for binary. Order is _0 _1, _2, ...
+            # Find all existing binaries with the githash
+            current_githash_binaries, current_indicies = githash_candidates()
+
+            print("Binaries matching current githash:", current_githash_binaries)
+
+            # If none exist, put it without index. Otherwise, add postfix index
+            if current_githash_binaries == []:
+                info(f"No binaries with hash {scarab_githash} exist. Creating version 0...", dbg_lvl)
+                githash_name = _cache_bin_name(f"scarab_{scarab_githash}_0", build_mode)
+                githash_scarab_bin = f"{infra_dir}/scarab_builds/{githash_name}"
+            else:
+                print("Versions matching current githash:", current_githash_binaries)
+                next_index = max(current_indicies) + 1 if current_indicies else 1
+                print("New index:", next_index)
+                githash_name = _cache_bin_name(f"scarab_{scarab_githash}_{next_index}", build_mode)
+                githash_scarab_bin = f"{infra_dir}/scarab_builds/{githash_name}"
+
+            info(f"Copying scarab binary for {githash_scarab_bin} to cache", dbg_lvl)
+            shutil.copy2(scarab_bin, githash_scarab_bin)
+            pin_exec_src = f"{scarab_path}/src/pin/pin_exec/obj-intel64/pin_exec.so"
+            if os.path.isfile(pin_exec_src):
+                pin_cache = githash_name.replace("scarab_", "pin_exec_scarab_", 1)
+                shutil.copy2(pin_exec_src, f"{infra_dir}/scarab_builds/{pin_cache}")
+            current_path = Path(current_scarab_bin)
+            if current_path.exists() or current_path.is_symlink():
+                current_path.unlink()
+            # Keep scarab_current as a symlink to the hash-specific binary for traceability.
+            current_path.symlink_to(Path(githash_scarab_bin).name)
+            
+            pin_current_name = _cache_bin_name("pin_exec_scarab_current", build_mode)
+            pin_current_path = Path(f"{infra_dir}/scarab_builds/{pin_current_name}")
+            pin_githash_name = githash_name.replace("scarab_", "pin_exec_scarab_", 1)
+            if Path(f"{infra_dir}/scarab_builds/{pin_githash_name}").exists():
+                if pin_current_path.exists() or pin_current_path.is_symlink():
+                    pin_current_path.unlink()
+                pin_current_path.symlink_to(pin_githash_name)
+
+    except Exception as e:
+        err(f"Scarab build failed! {str(e)}", dbg_lvl)
+        raise e
+
+    # Check for suitable current binary in cache after build
+    if not os.path.isfile(current_scarab_bin):
+        err(f"Scarab binary for current hash not found in cache after building", dbg_lvl)
+        exit(1)
+
+    print("Scarab build successful!")
+
+# copy_scarab deprecated
+# new API prepare_simulation
+# Copies specified scarab binary, parameters, and launch scripts
+# Inputs:   user        - username
+#           scarab_path - Path to the scarab repository on host
+#           docker_home - Path to the directory on host to be mount to the docker container home
+#           experiment_name - Name of the current experiment
+#           architecture - Architecture name
+#
+# Outputs:  scarab githash
+def prepare_simulation(user, scarab_path, scarab_build, docker_home, experiment_name, architecture, docker_prefix_list, githash, infra_dir, scarab_binaries, interactive_shell=False, dbg_lvl=1, stream_build=False, rebuild_hint=None):
+    # prepare docker images
+    image_tag_list = []
+    try:
+        for docker_prefix in docker_prefix_list:
+            image_tag = f"{docker_prefix}:{githash}"
+            image_tag_list.append(image_tag)
+            prepare_docker_image(docker_prefix, image_tag, dbg_lvl)
+    except subprocess.CalledProcessError as e:
+        info(f"Docker image preparation failed: {e.stderr if isinstance(e.stderr, str) else e.stderr.decode() if e.stderr else str(e)}", dbg_lvl)
+        raise e
+    except Exception as e:
+        info(f"Unexpected error during docker image preparation: {str(e)}", dbg_lvl)
+        raise e
+
+    try:
+        scarab_githash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=scarab_path).decode("utf-8").strip()
+    except Exception as e:
+        err(f"Could not get scarab githash: {str(e)}", dbg_lvl)
+        raise e
+
+    info(f"Current scarab git hash: {scarab_githash}", dbg_lvl)
+
+    if not os.path.exists(f"{infra_dir}/scarab_builds"):
+        os.system(f"mkdir -p {infra_dir}/scarab_builds")
+
+    ## Copy required scarab files into the experiment folder
+    docker_prefix = docker_prefix_list[0]
+    docker_container_name = None
+    try:
+        local_uid = os.getuid()
+        local_gid = os.getgid()
+
+        experiment_dir = f"{docker_home}/simulations/{experiment_name}"
+        os.system(f"mkdir -p {experiment_dir}/logs/")
+        dest_scarab_bin = f"{experiment_dir}/scarab/src/scarab"
+        build_mode = scarab_build if scarab_build else "opt"
+
+        binary_pattern = re.compile(
+            r"^scarab_([0-9a-fA-F]+)(?:_(\d+))?(?:\.(opt-avx|opt|dbg))?$"
+        )
+
+        # Make sure each requested scarab binary is present; build from git hash if missing
+        for bin_name in scarab_binaries:
+            # Current will build if not present
+            if bin_name == "scarab_current":
+                continue
+
+            cache_name = _cache_bin_name(bin_name, build_mode)
+            scarab_ver = f"{infra_dir}/scarab_builds/{cache_name}"
+            if os.path.isfile(scarab_ver):
+                info(f"Scarab binary named {bin_name} found in cache!", dbg_lvl)
+                continue
+
+            match = binary_pattern.match(bin_name)
+            if not match:
+                err(
+                    f"Scarab binary named {bin_name} not found in cache and the name does not include a git hash. "
+                    "Build it manually or rename to 'scarab_<githash>[_index]'.",
+                    dbg_lvl,
+                )
+                raise RuntimeError(f"Missing scarab binary {bin_name}")
+
+            target_hash = match.group(1)
+            warn(f"Missing Scarab binary with git version {target_hash}. Building...", dbg_lvl)
+            _build_missing_scarab_version(
+                bin_name,
+                target_hash,
+                user,
+                scarab_path,
+                scarab_build,
+                docker_home,
+                docker_prefix,
+                githash,
+                infra_dir,
+                dbg_lvl,
+            )
+            note(f"Scarab version {target_hash} built successfully!", dbg_lvl)
+
+        if interactive_shell:
+            _warn_interactive_binary_statuses(
+                infra_dir,
+                scarab_path,
+                scarab_githash,
+                dbg_lvl,
+                rebuild_hint=rebuild_hint,
+            )
+
+        if "scarab_current" in scarab_binaries:
+            # Interactive shells should not force a rebuild just to open the environment.
+            current_cache_name = _cache_bin_name("scarab_current", build_mode)
+            current_scarab_bin = f"{infra_dir}/scarab_builds/{current_cache_name}"
+            repo_scarab_bin = f"{scarab_path}/src/build/{build_mode}/scarab"
+            if interactive_shell:
+                if os.path.isfile(current_scarab_bin):
+                    info(
+                        f"Using cached Scarab binary for interactive mode: {current_scarab_bin}",
+                        dbg_lvl,
+                    )
+                elif os.path.isfile(repo_scarab_bin):
+                    shutil.copy2(repo_scarab_bin, current_scarab_bin)
+                    info(
+                        "Interactive mode: reused existing Scarab repo binary without rebuilding.",
+                        dbg_lvl,
+                    )
+                else:
+                    warn(
+                        "Interactive mode requested, but no cached or repo Scarab binary exists; "
+                        "continuing without rebuilding.",
+                        dbg_lvl,
+                    )
+            else:
+                # Only rebuild/current-state validate when the descriptor actually uses scarab_current.
+                rebuild_scarab(
+                    infra_dir,
+                    scarab_path,
+                    user,
+                    docker_home,
+                    docker_prefix,
+                    githash,
+                    scarab_githash,
+                    scarab_build,
+                    stream_build=stream_build,
+                    dbg_lvl=dbg_lvl,
+                )
+
+        # Copy architectural params to scarab/src
+        arch_params = f"{scarab_path}/src/PARAMS.{architecture}"
+        os.system(f"mkdir -p {experiment_dir}/scarab/src/")
+        # Copy pin_exec.so to scarab/src/pin/pin_exec/obj-intel64/pin_exec.so
+        pin_exec_so = f"{scarab_path}/src/pin/pin_exec/obj-intel64/pin_exec.so"
+        os.system(f"mkdir -p {experiment_dir}/scarab/src/pin/pin_exec/obj-intel64/")
+
+        # Copy from cache all required scarab binaries
+        for bin_name in scarab_binaries:
+            cache_name = _cache_bin_name(bin_name, build_mode)
+            scarab_ver = f"{infra_dir}/scarab_builds/{cache_name}"
+            dest_dir = Path(experiment_dir) / "scarab" / "src"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            if not os.path.isfile(scarab_ver):
+                if interactive_shell and bin_name == "scarab_current":
+                    warn(
+                        f"Skipping missing interactive Scarab binary: {scarab_ver}",
+                        dbg_lvl,
+                    )
+                    continue
+                raise FileNotFoundError(f"Required Scarab binary not found: {scarab_ver}")
+            dest_plain = dest_dir / bin_name
+            if bin_name.endswith((".opt", ".dbg")):
+                dest_mode = dest_plain
+            else:
+                dest_mode = dest_dir / f"{bin_name}.{build_mode}"
+            try:
+                shutil.copy2(scarab_ver, dest_plain)
+            except Exception:
+                os.system(f"cp {scarab_ver} {dest_plain}")
+            if dest_mode != dest_plain:
+                try:
+                    shutil.copy2(scarab_ver, dest_mode)
+                except Exception:
+                    os.system(f"cp {scarab_ver} {dest_mode}")
+
+            pin_cache_name = _cache_bin_name(f"pin_exec_{bin_name}", build_mode)
+            if not pin_cache_name.endswith(".so"):
+                pin_cache_name += ".so"
+            
+            pin_cached = f"{infra_dir}/scarab_builds/{pin_cache_name}"
+            pin_obj_dir = dest_dir / "pin" / "pin_exec" / "obj-intel64"
+            pin_obj_dir.mkdir(parents=True, exist_ok=True)
+            pin_dest = pin_obj_dir / f"pin_exec_{bin_name}.so"
+
+            pin_src = pin_cached if os.path.isfile(pin_cached) else pin_exec_so
+            try:
+                shutil.copy2(pin_src, pin_dest)
+            except Exception:
+                os.system(f"cp {pin_src} {pin_dest}")
+
+        os.system(f"cp {arch_params} {experiment_dir}/scarab/src")
+
+        # Export hash-specific PARAMS so each scarab binary can use matching defaults.
+        for bin_name in scarab_binaries:
+            match = binary_pattern.match(bin_name)
+            if not match:
+                continue
+            target_hash = match.group(1)
+            params_target = f"{experiment_dir}/scarab/src/PARAMS.{architecture}.{target_hash}"
+            if os.path.isfile(params_target):
+                continue
+            try:
+                params_blob = subprocess.check_output(
+                    ["git", "show", f"{target_hash}:src/PARAMS.{architecture}"],
+                    cwd=scarab_path,
+                )
+            except Exception as exc:
+                warn(
+                    f"Unable to load PARAMS.{architecture} for scarab {target_hash}: {exc}",
+                    dbg_lvl,
+                )
+                continue
+            with open(params_target, "wb") as handle:
+                handle.write(params_blob)
+
+        # Required for non mode 4. Copy launch scripts from the docker container's scarab repo.
+        # NOTE: Could cause issues if a copied version of scarab is incompatible with the version of
+        # the launch scripts in the docker container's repo
+        os.system(f"mkdir -p {experiment_dir}/scarab/bin/scarab_globals")
+        os.system(f"cp {scarab_path}/bin/scarab_launch.py  {experiment_dir}/scarab/bin/scarab_launch.py ")
+        os.system(f"cp {scarab_path}/bin/scarab_globals/*  {experiment_dir}/scarab/bin/scarab_globals/ ")
+
+        return scarab_githash, image_tag_list
+    except subprocess.CalledProcessError as e:
+        if docker_container_name:
+            try:
+                subprocess.run(["docker", "rm", "-f", docker_container_name], check=True)
+                info(f"Removed container: {docker_container_name}", dbg_lvl)
+            except subprocess.CalledProcessError:
+                info(f"Could not remove container: {docker_container_name}", dbg_lvl)
+
+        info(f"Scarab build failed: {e.stderr if isinstance(e.stderr, str) else e.stderr.decode() if e.stderr else str(e)}", dbg_lvl)
+        raise e
+    except Exception as e:
+        if docker_container_name:
+            try:
+                subprocess.run(["docker", "rm", "-f", docker_container_name], check=True)
+                info(f"Removed container: {docker_container_name}", dbg_lvl)
+            except subprocess.CalledProcessError:
+                info(f"Could not remove container: {docker_container_name}", dbg_lvl)
+        info(f"Unexpected error during scarab build: {str(e)}", dbg_lvl)
+
+        raise e
+
+def finish_simulation(user, docker_home, descriptor_path, root_dir, experiment_name, image_tag_list, slurm_ids = None, dont_collect = False, slurm_options=""):
+    experiment_dir = f"{root_dir}/simulations/{experiment_name}"
+    # clean up docker images only when no container is running on top of the image (the other user may be using it)
+    # ignore the exception to ignore the rmi failure due to existing containers
+    images = ' '.join(image_tag_list)
+    clean_cmd = f"scripts/docker_cleaner.py --images {images}"
+    if slurm_ids:
+        sbatch_cmd = f"sbatch{slurm_options} --nodelist=bohr3 --dependency=afterany:{','.join(slurm_ids)} -o {experiment_dir}/logs/stat_collection_job_%j.out "
+        clean_cmd = sbatch_cmd + clean_cmd
+    print(clean_cmd)
+    os.system(clean_cmd)
+
+    if dont_collect:
+        return
+
+    descriptor_abs = os.path.abspath(descriptor_path)
+    stats_output = os.path.join(experiment_dir, "collected_stats.csv")
+    stat_script = os.path.join(project_root, "scarab_stats", "stat_collector.py")
+
+    conda_cmd = os.environ.get("CONDA_EXE")
+    if conda_cmd:
+        conda_cmd = str(Path(conda_cmd).expanduser())
+    else:
+        user_conda = Path.home() / "miniconda3" / "bin" / "conda"
+        if user_conda.exists():
+            conda_cmd = str(user_conda)
+        else:
+            conda_cmd = shutil.which("conda")
+    python_executable = sys.executable
+    env_python = None
+    if conda_cmd:
+        try:
+            output = subprocess.check_output(
+                [conda_cmd, "env", "list", "--json"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            data = json.loads(output or "{}")
+            for env in data.get("envs", []):
+                if Path(env).name == DEFAULT_CONDA_ENV:
+                    candidate = Path(env) / "bin" / "python"
+                    if candidate.exists():
+                        env_python = str(candidate)
+                        break
+        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+            env_python = None
+
+    tmp_dir = os.environ.get("TMPDIR")
+    if not tmp_dir or not os.path.isdir(tmp_dir):
+        tmp_dir = os.path.join(experiment_dir, "tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+
+    if env_python:
+        stat_runner_parts = [env_python, stat_script]
+    elif conda_cmd:
+        stat_runner_parts = [
+            conda_cmd,
+            "run",
+            "-n",
+            DEFAULT_CONDA_ENV,
+            "python",
+            stat_script,
+        ]
+    else:
+        stat_runner_parts = [python_executable, stat_script]
+
+    repo_pythonpath_entries = [project_root]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    if existing_pythonpath:
+        repo_pythonpath_entries.append(existing_pythonpath)
+    repo_pythonpath = os.pathsep.join(repo_pythonpath_entries)
+
+    collect_parts = [
+        "env",
+        f"TMPDIR={tmp_dir}",
+        f"PYTHONPATH={repo_pythonpath}",
+    ] + stat_runner_parts + [
+        "-d",
+        descriptor_abs,
+        "-o",
+        stats_output,
+        "--postprocess",
+        "--skip-incomplete",
+    ]
+    collect_stats_cmd = shlex.join(collect_parts)
+
+    if slurm_ids:
+        # afterok will not run if jobs fail. afterany used with stat_collector's error checking
+        log_path = os.path.join(experiment_dir, "logs", "stat_collection_job_%j.out")
+        sbatch_cmd = (
+            f"sbatch{slurm_options} --dependency=afterany:{','.join(slurm_ids)} "
+            f"-o {shlex.quote(log_path)} --wrap={shlex.quote(collect_stats_cmd)}"
+        )
+        collect_stats_cmd = sbatch_cmd
+
+    os.system(collect_stats_cmd)
+
+# Generate command to do a single run of scarab
+def generate_single_scarab_run_command(user, workload_home, experiment, config_key, config,
+                                       mode, seg_size, arch, scarab_binary, cluster_id,
+                                       warmup, trace_warmup, trace_type, trace_file,
+                                       env_vars, bincmd, client_bincmd):
+
+    if mode == "memtrace":
+        command = f"run_memtrace_single_simpoint.sh \\\"{workload_home}\\\" \\\"/home/{user}/simulations/{experiment}/{config_key}\\\" \\\"{config}\\\" \\\"{seg_size}\\\" \\\"{arch}\\\" \\\"{warmup}\\\" \\\"{trace_warmup}\\\" \\\"{trace_type}\\\" /home/{user}/simulations/{experiment}/scarab {cluster_id} {trace_file} {scarab_binary}"
+    elif mode == "pt":
+        command = f"run_pt_single_simpoint.sh \\\"{workload_home}\\\" \\\"/home/{user}/simulations/{experiment}/{config_key}\\\" \\\"{config}\\\" \\\"{arch}\\\" \\\"{warmup}\\\" /home/{user}/simulations/{experiment}/scarab {scarab_binary}"
+    elif mode == "exec":
+        env_vars_safe = env_vars if env_vars else ""
+        client_bincmd_safe = client_bincmd if client_bincmd else ""
+        command = (
+            "run_exec_single_simpoint.sh "
+            f"\\\"{workload_home}\\\" "                      # $1 WORKLOAD_HOME
+            f"\\\"/home/{user}/simulations/{experiment}/{config_key}\\\" "  # $2 SCENARIO
+            f"\\\"{config}\\\" "                             # $3 SCARABPARAMS
+            f"\\\"{seg_size}\\\" "                           # $4 SEGSIZE
+            f"\\\"{arch}\\\" "                               # $5 SCARABARCH
+            f"\\\"{warmup}\\\" "                             # $6 WARMUP
+            f"\\\"/home/{user}/simulations/{experiment}/scarab\\\" "  # $7 SCARABHOME
+            f"\\\"{cluster_id}\\\" "                         # $8 SEGMENT_ID
+            f"\\\"{env_vars_safe}\\\" "                      # $9 ENVVAR
+            f"\\\"{bincmd}\\\" "                             # $10 BINCMD (stay as one arg)
+            f"\\\"{client_bincmd_safe}\\\" "                 # $11 CLIENT_BINCMD
+            f"\\\"{scarab_binary}\\\""                       # $12 SCARAB_BIN
+        )
+    else:
+        command = ""
+
+    return command
+
+def write_docker_command_to_file_run_by_root(user, local_uid, local_gid, workload, workload_home, experiment_name,
+                                             docker_prefix, docker_container_name, traces_dir,
+                                             docker_home, githash, config_key, config, scarab_mode, seg_size, scarab_githash,
+                                             architecture, cluster_id, warmup, trace_warmup, trace_type, trace_file,
+                                             env_vars, bincmd, client_bincmd, filename):
+    try:
+        scarab_cmd = generate_single_scarab_run_command(user, workload_home, experiment_name, config_key, config,
+                                                        scarab_mode, seg_size, architecture, scarab_githash, cluster_id,
+                                                        warmup, trace_warmup, trace_type, trace_file, env_vars, bincmd, client_bincmd)
+        with open(filename, "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write(f"echo \"Running {config_key} {workload_home} {cluster_id}\"\n")
+            f.write("echo \"Running on $(uname -n)\"\n")
+            f.write(f"docker run --rm \
+            -e user_id={local_uid} \
+            -e group_id={local_gid} \
+            -e username={user} \
+            -e HOME=/home/{user} \
+            --name {docker_container_name} \
+            --mount type=bind,source={traces_dir},target=/simpoint_traces,readonly=true \
+            --mount type=bind,source={docker_home},target=/home/{user},readonly=false \
+            {docker_prefix}:{githash} \
+            /bin/bash {scarab_cmd}\n")
+    except Exception as e:
+        raise e
+
+def write_docker_command_to_file(user, local_uid, local_gid, workload, workload_home, experiment_name,
+                                 docker_prefix, docker_container_name, traces_dir,
+                                 docker_home, githash, config_key, config, scarab_mode, scarab_binary,
+                                 seg_size, architecture, cluster_id, warmup, trace_warmup, trace_type,
+                                 trace_file, env_vars, bincmd, client_bincmd, filename, infra_dir, application_dir, slurm=False):
+    try:
+        scarab_cmd = generate_single_scarab_run_command(user, workload_home, experiment_name, config_key, config,
+                                                        scarab_mode, seg_size, architecture, scarab_binary, cluster_id,
+                                                        warmup, trace_warmup, trace_type, trace_file, env_vars, bincmd, client_bincmd)
+        with open(filename, "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write(f"echo \"Running {config_key} {workload_home} {cluster_id} {scarab_mode}\"\n")
+            f.write(f"echo \"Simulation mode: {scarab_mode}\"\n")
+            f.write(f"echo \"Script name: {filename}\"\n")
+            f.write("echo \"Running on $(uname -n)\"\n")
+            f.write(f"CONTAINER_NAME={docker_container_name}\n")
+            f.write("cleanup_container() {\n")
+            f.write("    docker rm -f \"$CONTAINER_NAME\" >/dev/null 2>&1 || true\n")
+            f.write("}\n")
+            f.write("trap cleanup_container EXIT INT TERM HUP\n")
+            f.write(f"cd {infra_dir}\n")
+            f.write(f"python -m scripts.prepare_docker_image --docker-prefix {docker_prefix} --githash {githash} \n")
+            f.write(f"cd -\n")
+            if slurm:
+                f.write("SLURM_CGROUP=$(cat /proc/self/cgroup | cut -d: -f3 | head -n 1)\n")
+                f.write("echo $SLURM_CGROUP\n")
+                f.write(f"docker run --privileged\
+                --cgroup-parent $SLURM_CGROUP \
+                --cgroupns=host \
+                -e user_id={local_uid} \
+                -e group_id={local_gid} \
+                -e username={user} \
+                -e HOME=/home/{user} \
+                -e APP_GROUPNAME={docker_prefix} \
+                -e APPNAME={workload} \
+                -dit \
+                --rm \
+                --name $CONTAINER_NAME \
+                --mount type=bind,source={traces_dir},target=/simpoint_traces,readonly=true \
+                --mount type=bind,source={docker_home},target=/home/{user},readonly=false \
+                --mount type=bind,source={application_dir},target=/tmp_home/application,readonly=false \
+                {docker_prefix}:{githash} \
+                /bin/bash\n")
+            else:
+                f.write(f"docker run --privileged\
+                -e user_id={local_uid} \
+                -e group_id={local_gid} \
+                -e username={user} \
+                -e HOME=/home/{user} \
+                -e APP_GROUPNAME={docker_prefix} \
+                -e APPNAME={workload} \
+                -dit \
+                --rm \
+                --name $CONTAINER_NAME \
+                --mount type=bind,source={traces_dir},target=/simpoint_traces,readonly=true \
+                --mount type=bind,source={docker_home},target=/home/{user},readonly=false \
+                --mount type=bind,source={application_dir},target=/tmp_home/application,readonly=false \
+                {docker_prefix}:{githash} \
+                /bin/bash\n")
+            f.write(f"docker cp {infra_dir}/scripts/utilities.sh $CONTAINER_NAME:/usr/local/bin\n")
+            f.write(f"docker cp {infra_dir}/common/scripts/root_entrypoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+            f.write(f"docker cp {infra_dir}/common/scripts/user_entrypoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+            if os.path.exists(f"{infra_dir}/workloads/{docker_prefix}/workload_root_entrypoint.sh"):
+                f.write(f"docker cp {infra_dir}/workloads/{docker_prefix}/workload_root_entrypoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+            if os.path.exists(f"{infra_dir}/workloads/{docker_prefix}/workload_user_entrypoint.sh"):
+                f.write(f"docker cp {infra_dir}/workloads/{docker_prefix}/workload_user_entrypoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+            if scarab_mode == "memtrace":
+                f.write(f"docker cp {infra_dir}/common/scripts/run_memtrace_single_simpoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+            elif scarab_mode == "pt":
+                f.write(f"docker cp {infra_dir}/common/scripts/run_pt_single_simpoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+            elif scarab_mode == "exec":
+                f.write(f"docker cp {infra_dir}/common/scripts/run_exec_single_simpoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+                f.write("docker exec --privileged $CONTAINER_NAME /bin/bash -c \"echo 0 | sudo tee /proc/sys/kernel/randomize_va_space\"\n")
+            f.write("docker exec --privileged $CONTAINER_NAME /bin/bash -c '/usr/local/bin/root_entrypoint.sh'\n")
+            f.write(f"docker exec --user={user} $CONTAINER_NAME /bin/bash -c \"source /usr/local/bin/user_entrypoint.sh && {scarab_cmd}\" || echo \"Scarab error detected\"\n")
+            f.write("cleanup_container\n")
+            f.write("echo \"Completed Simulation\"\n")
+            f.write(f"sync {docker_home}/simulations/{experiment_name}/logs")
+    except Exception as e:
+        raise e
+
+def generate_single_trace_run_command(user, workload, image_name, trace_name, binary_cmd, client_bincmd, simpoint_mode, drio_args, clustering_k):
+    command = ""
+    if simpoint_mode == "cluster_then_trace":
+        mode = 1
+    elif simpoint_mode == "trace_then_post_process":
+        mode = 2
+    elif simpoint_mode == "iterative_trace":
+        mode = 3
+    command = f"python3 -u /usr/local/bin/run_simpoint_trace.py --workload {workload} --suite {image_name} --simpoint_mode {mode} --simpoint_home \\\"/home/{user}/simpoint_flow/{trace_name}\\\" --bincmd \\\"{binary_cmd}\\\""
+    if client_bincmd != None:
+        command = f"{command} --client_bincmd \\\"{client_bincmd}\\\""
+    if drio_args != None:
+        command = f"{command} --drio_args {drio_args}"
+    if clustering_k != None:
+        command = f"{command} -userk {clustering_k}"
+    return command
+
+def write_trace_docker_command_to_file(user, local_uid, local_gid, docker_container_name, githash,
+                                       workload, image_name, trace_name, traces_dir, docker_home,
+                                       env_vars, binary_cmd, client_bincmd, simpoint_mode, drio_args,
+                                       clustering_k, filename, infra_dir, application_dir, slurm = False):
+    try:
+        trace_cmd = generate_single_trace_run_command(user, workload, image_name, trace_name, binary_cmd, client_bincmd,
+                                                      simpoint_mode, drio_args, clustering_k)
+        with open(filename, "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write(f"echo \"Tracing {workload}\"\n")
+            f.write("echo \"Running on $(uname -n)\"\n")
+            f.write(f"CONTAINER_NAME={docker_container_name}\n")
+            f.write("cleanup_container() {\n")
+            f.write("    docker rm -f \"$CONTAINER_NAME\" >/dev/null 2>&1 || true\n")
+            f.write("}\n")
+            f.write("trap cleanup_container EXIT INT TERM HUP\n")
+            command = f"docker run --privileged \
+                    -e user_id={local_uid} \
+                    -e group_id={local_gid} \
+                    -e username={user} \
+                    -e HOME=/home/{user} \
+                    -e APP_GROUPNAME={image_name} \
+                    -e APPNAME={workload} "
+
+            if slurm:
+                f.write("SLURM_CGROUP=$(cat /proc/self/cgroup | cut -d: -f3 | head -n 1)\n")
+                f.write("echo $SLURM_CGROUP\n")
+                command += "--cgroup-parent $SLURM_CGROUP \
+                            --cgroupns=host "
+
+            if env_vars:
+                for env in env_vars:
+                    command = command + f"-e {env} "
+            command = command + f"-dit \
+                    --name $CONTAINER_NAME \
+                    --mount type=bind,source={docker_home},target=/home/{user},readonly=false \
+                    --mount type=bind,source={application_dir},target=/tmp_home/application,readonly=false \
+                    {image_name}:{githash} \
+                    /bin/bash\n"
+            f.write(f"{command}")
+            f.write(f"docker cp {infra_dir}/scripts/utilities.sh $CONTAINER_NAME:/usr/local/bin\n")
+            f.write(f"docker cp {infra_dir}/common/scripts/root_entrypoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+            f.write(f"docker cp {infra_dir}/common/scripts/user_entrypoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+            if os.path.exists(f"{infra_dir}/workloads/{image_name}/workload_root_entrypoint.sh"):
+                f.write(f"docker cp {infra_dir}/workloads/{image_name}/workload_root_entrypoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+            if os.path.exists(f"{infra_dir}/workloads/{image_name}/workload_user_entrypoint.sh"):
+                f.write(f"docker cp {infra_dir}/workloads/{image_name}/workload_user_entrypoint.sh $CONTAINER_NAME:/usr/local/bin\n")
+            f.write(f"docker cp {infra_dir}/common/scripts/run_clustering.sh $CONTAINER_NAME:/usr/local/bin\n")
+            f.write(f"docker cp {infra_dir}/common/scripts/run_simpoint_trace.py $CONTAINER_NAME:/usr/local/bin\n")
+            f.write(f"docker cp {infra_dir}/common/scripts/minimize_trace.sh $CONTAINER_NAME:/usr/local/bin\n")
+            f.write(f"docker cp {infra_dir}/common/scripts/replace_oversized_simpoints.py $CONTAINER_NAME:/usr/local/bin\n")
+            f.write(f"docker cp {infra_dir}/common/scripts/run_trace_post_processing.sh $CONTAINER_NAME:/usr/local/bin\n")
+            f.write(f"docker cp {infra_dir}/common/scripts/gather_fp_pieces.py $CONTAINER_NAME:/usr/local/bin\n")
+            f.write("docker exec --privileged $CONTAINER_NAME /bin/bash -c '/usr/local/bin/root_entrypoint.sh'\n")
+            f.write("docker exec --privileged $CONTAINER_NAME /bin/bash -c \"echo 0 | sudo tee /proc/sys/kernel/randomize_va_space\"\n")
+            f.write(f"docker exec --privileged --user={user} --workdir=/home/{user} $CONTAINER_NAME /bin/bash -c \"source /usr/local/bin/user_entrypoint.sh && {trace_cmd}\"\n")
+            f.write("cleanup_container\n")
+    except Exception as e:
+        raise e
+
+def get_simpoints (workload_data, sim_mode, dbg_lvl = 2):
+    simpoints = {}
+    if sim_mode == "memtrace" or sim_mode == "exec":
+        for simpoint in workload_data["simpoints"]:
+            simpoints[f"{simpoint['cluster_id']}"] = simpoint["weight"]
+    else:
+        simpoints["0"] = 1.0
+
+    return simpoints
+
+def get_image_name(workloads_data, simulation):
+    suite = simulation["suite"]
+    subsuite = simulation["subsuite"]
+    workload = simulation["workload"]
+    cluster_id = simulation["cluster_id"]
+    sim_mode = simulation["simulation_type"]
+
+    if isinstance(workload, list):
+        workload = workload[0]
+    if workload != None:
+        if subsuite == None:
+            subsuite = next(iter(workloads_data[suite]))
+        predef_sim_mode = workloads_data[suite][subsuite][workload]["simulation"]["prioritized_mode"]
+        if sim_mode == None:
+            sim_mode = predef_sim_mode
+        return workloads_data[suite][subsuite][workload]["simulation"][sim_mode]["image_name"]
+
+    if subsuite != None:
+        workload = next(k for k in workloads_data[suite][subsuite] if isinstance(workloads_data[suite][subsuite][k], dict))
+        predef_sim_mode = workloads_data[suite][subsuite][workload]["simulation"]["prioritized_mode"]
+        if sim_mode == None:
+            sim_mode = predef_sim_mode
+    else:
+        subsuite = next(iter(workloads_data[suite]))
+        workload = next(k for k in workloads_data[suite][subsuite] if isinstance(workloads_data[suite][subsuite][k], dict))
+        predef_sim_mode = workloads_data[suite][subsuite][workload]["simulation"]["prioritized_mode"]
+        if sim_mode == None:
+            sim_mode = predef_sim_mode
+
+    return workloads_data[suite][subsuite][workload]["simulation"][sim_mode]["image_name"]
+
+def normalize_simulations(simulations):
+    """Expand simulation entries where 'workload' is a list into individual entries."""
+    expanded = []
+    for sim in simulations:
+        workload = sim.get("workload")
+        if isinstance(workload, list):
+            if len(workload) > 1 and sim.get("cluster_id") is not None:
+                raise ValueError(
+                    f"cluster_id must be null when workload is a list with multiple entries, "
+                    f"got cluster_id={sim['cluster_id']} with workload={workload}"
+                )
+            if len(workload) == 0:
+                expanded.append({**sim, "workload": None})
+            else:
+                for w in workload:
+                    expanded.append({**sim, "workload": w})
+        else:
+            expanded.append(sim)
+    return expanded
+
+def get_simulation_jobs(descriptor_data, workloads_data, docker_prefix, user, dbg_lvl = 1):
+    experiment_name = descriptor_data["experiment"]
+    configs = descriptor_data["configurations"]
+    simulations = normalize_simulations(descriptor_data["simulations"])
+
+    def get_simpoints_wrapper(suite, subsuite, workload, exp_cluster_id, sim_mode):
+        if "simpoints" not in workloads_data[suite][subsuite][workload].keys():
+            return [0]
+        if exp_cluster_id == None:
+            return list(map(int, get_simpoints(workloads_data[suite][subsuite][workload], sim_mode, dbg_lvl).keys()))
+        if exp_cluster_id > 0:
+            assert isinstance(exp_cluster_id, int), f"exp_cluster_id must be of type int, but got {type(exp_cluster_id)}"
+            return [exp_cluster_id]
+        return [0]
+
+    all_jobs = []
+
+    def docker_container_name(workload, config, cluster, sim_mode, img_name):
+        return f"{img_name}_{workload}_{experiment_name}_{config.replace('/', '-')}_{cluster}_{sim_mode}_{user}"
+
+    for simulation in simulations:
+        suite = simulation["suite"]
+        subsuite = simulation["subsuite"]
+        workload = simulation["workload"]
+        exp_cluster_id = simulation["cluster_id"]
+        sim_mode = simulation["simulation_type"]
+
+        image_name = get_image_name(workloads_data, simulation)
+
+        if image_name not in docker_prefix:
+            print(f"suite {image_name} not in docker_prefix")
+            exit()
+
+        if workload == None and subsuite == None:
+            for subsuite_ in workloads_data[suite].keys():
+                for workload_ in workloads_data[suite][subsuite_].keys():
+                    if not isinstance(workloads_data[suite][subsuite_][workload_], dict):
+                        continue
+                    sim_mode_ = sim_mode
+                    if sim_mode_ == None:
+                        sim_mode_ = workloads_data[suite][subsuite_][workload_]["simulation"]["prioritized_mode"]
+                    simpoint_ids = get_simpoints_wrapper(suite, subsuite_, workload_, exp_cluster_id, sim_mode_) * len(configs)
+                    all_jobs += [
+                        docker_container_name(workload_, config, cluster_id, sim_mode_, image_name)
+                        for config in configs.keys()
+                        for cluster_id in simpoint_ids
+                    ]
+        elif workload == None and subsuite != None:
+            for workload_ in workloads_data[suite][subsuite].keys():
+                if not isinstance(workloads_data[suite][subsuite][workload_], dict):
+                    continue
+                sim_mode_ = sim_mode
+                if sim_mode_ == None:
+                    sim_mode_ = workloads_data[suite][subsuite][workload_]["simulation"]["prioritized_mode"]
+                simpoint_ids = get_simpoints_wrapper(suite, subsuite, workload_, exp_cluster_id, sim_mode_) * len(configs)
+                all_jobs += [
+                    docker_container_name(workload_, config, cluster_id, sim_mode_, image_name)
+                    for config in configs.keys()
+                    for cluster_id in simpoint_ids
+                ]
+        else:
+            sim_mode_ = sim_mode
+            if sim_mode_ == None:
+                sim_mode_ = workloads_data[suite][subsuite][workload]["simulation"]["prioritized_mode"]
+            simpoint_ids = get_simpoints_wrapper(suite, subsuite, workload, exp_cluster_id, sim_mode_) * len(configs)
+            all_jobs += [
+                docker_container_name(workload, config, cluster_id, sim_mode_, image_name)
+                for config in configs.keys()
+                for cluster_id in simpoint_ids
+            ]
+
+    return set(all_jobs)
+
+# Returns (config, suite, subsuite, workload_, cluster_id) for all jobs in config
+def get_simulation_job_identifiers(descriptor_data, workloads_data, dbg_lvl = 1):
+    experiment_name = descriptor_data["experiment"]
+    configs = descriptor_data["configurations"]
+    simulations = normalize_simulations(descriptor_data["simulations"])
+
+    def get_simpoints_wrapper(suite, subsuite, workload, exp_cluster_id, sim_mode):
+        if "simpoints" not in workloads_data[suite][subsuite][workload].keys():
+            return [0]
+        if exp_cluster_id == None:
+            return list(map(int, get_simpoints(workloads_data[suite][subsuite][workload], sim_mode, dbg_lvl).keys()))
+        if exp_cluster_id > 0:
+            assert isinstance(exp_cluster_id, int), f"exp_cluster_id must be of type int, but got {type(exp_cluster_id)}"
+            return [exp_cluster_id]
+        return [0]
+
+    all_jobs = []
+
+    for simulation in simulations:
+        suite = simulation["suite"]
+        subsuite = simulation["subsuite"]
+        workload = simulation["workload"]
+        exp_cluster_id = simulation["cluster_id"]
+        sim_mode = simulation["simulation_type"]
+
+        if workload == None and subsuite == None:
+            for subsuite_ in workloads_data[suite].keys():
+                for workload_ in workloads_data[suite][subsuite_].keys():
+                    if not isinstance(workloads_data[suite][subsuite_][workload_], dict):
+                        continue
+                    sim_mode_ = sim_mode
+                    if sim_mode_ == None:
+                        sim_mode_ = workloads_data[suite][subsuite_][workload_]["simulation"]["prioritized_mode"]
+                    simpoint_ids = get_simpoints_wrapper(suite, subsuite_, workload_, exp_cluster_id, sim_mode_) * len(configs)
+                    all_jobs += [
+                        (config, suite, subsuite_, workload_, cluster_id)
+                        for config in configs.keys()
+                        for cluster_id in simpoint_ids
+                    ]
+        elif workload == None and subsuite != None:
+            for workload_ in workloads_data[suite][subsuite].keys():
+                if not isinstance(workloads_data[suite][subsuite][workload_], dict):
+                    continue
+                sim_mode_ = sim_mode
+                if sim_mode_ == None:
+                    sim_mode_ = workloads_data[suite][subsuite][workload_]["simulation"]["prioritized_mode"]
+                simpoint_ids = get_simpoints_wrapper(suite, subsuite, workload_, exp_cluster_id, sim_mode_) * len(configs)
+                all_jobs += [
+                    (config, suite, subsuite, workload_, cluster_id)
+                    for config in configs.keys()
+                    for cluster_id in simpoint_ids
+                ]
+        else:
+            sim_mode_ = sim_mode
+            if sim_mode_ == None:
+                sim_mode_ = workloads_data[suite][subsuite][workload]["simulation"]["prioritized_mode"]
+            simpoint_ids = get_simpoints_wrapper(suite, subsuite, workload, exp_cluster_id, sim_mode_) * len(configs)
+            all_jobs += [
+                (config, suite, subsuite, workload, cluster_id)
+                for config in configs.keys()
+                for cluster_id in simpoint_ids
+            ]
+
+    return all_jobs
+
+def parse_job_log_header(first_line: str) -> Optional[Tuple[str, str, str, str, str]]:
+    """Parse the first line of a Slurm job log.
+
+    Expected format: ``Running {config} {suite}/{subsuite}/{workload} {cluster_id}``
+    or ``Running {config} {suite}/{subsuite}/{workload} {cluster_id} {simulation_mode}``
+
+    Returns ``(config, suite, subsuite, workload, cluster_id_str)`` or ``None`` if
+    the line does not match the expected format.
+    """
+    parts = first_line.split(" ")
+    if len(parts) < 4 or parts[0] != "Running":
+        return None
+    config = parts[1]
+    workload_path = parts[2]
+    cluster_id_str = parts[3]
+    path_parts = workload_path.split("/")
+    if len(path_parts) != 3:
+        return None
+    suite, subsuite, workload = path_parts
+    return (config, suite, subsuite, workload, cluster_id_str)
+
+def get_old_job_logs(log_dir: str) -> dict[Tuple[str, str, str, str, str], list[Path]]:
+    """
+    Returns ``job_*.out`` files that can be passed to ``remove_old_job_logs``
+    as a dictionary mapping (config, suite, subsuite, workload, cluster_id) to file paths.
+    """
+    log_path = Path(log_dir)
+    if not log_path.is_dir():
+        return {}
+    old_job_logs = {}
+    for old_log in log_path.glob("job_*.out"):
+        try:
+            with old_log.open(encoding="utf-8", errors="replace") as fh:
+                hdr = parse_job_log_header(fh.readline().strip())
+                old_job_logs.setdefault(hdr, []).append(old_log)
+        except OSError:
+            pass
+    return old_job_logs
+
+def remove_old_job_logs(
+        old_job_logs: dict[Tuple[str, str, str, str, str], list[Path]],
+        target_jobs: set[Tuple[str, str, str, str, str]], dbg_lvl = 1) -> int:
+    """Remove old job log files matching the given target jobs.
+
+    Scans given old ``job_*.out`` files whose header matches the target
+    key and deletes them so that stale logs don't inflate counts in --status.
+
+    Returns the number of removed files.
+    """
+    assert isinstance(old_job_logs, dict)
+    info("Removing old job logs", dbg_lvl)
+    removed = 0
+    for target in target_jobs:
+        for old_log in old_job_logs.get(target, []):
+            try:
+                old_log.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def parse_job_log_simulation_mode(log_lines) -> Optional[str]:
+    if not log_lines:
+        return None
+
+    first_parts = log_lines[0].split(" ")
+    if len(first_parts) >= 5 and first_parts[0] == "Running" and first_parts[4] in VALID_SIMULATION_MODES:
+        return first_parts[4]
+
+    for line in log_lines[1:8]:
+        stripped = line.strip()
+        if stripped.startswith("Simulation mode:"):
+            sim_mode = stripped.split(":", 1)[1].strip()
+            if sim_mode in VALID_SIMULATION_MODES:
+                return sim_mode
+        if stripped.startswith("Script name:"):
+            script_name = os.path.basename(stripped.split(":", 1)[1].strip())
+            match = re.search(r"_(memtrace|pt|exec)_[^/_]+(?:_tmp_run)?\.sh$", script_name)
+            if match:
+                return match.group(1)
+
+    return None
+
+
+def read_job_log_metadata(log_path: Path) -> Optional[Tuple[str, str, str, str, str, Optional[str]]]:
+    try:
+        with log_path.open(encoding="utf-8", errors="replace") as fh:
+            log_lines = [fh.readline().strip() for _ in range(8)]
+    except OSError:
+        return None
+
+    parsed = parse_job_log_header(log_lines[0] if log_lines else "")
+    if parsed is None:
+        return None
+
+    sim_mode = parse_job_log_simulation_mode(log_lines)
+    return (*parsed, sim_mode)
+
+
+def get_experiment_logs_dir(descriptor_data: dict) -> Path:
+    """Return the ``logs/`` directory path for the experiment described by *descriptor_data*."""
+    return (
+        Path(descriptor_data["root_dir"])
+        / "simulations"
+        / descriptor_data["experiment"]
+        / "logs"
+    )
+
+
+def iter_latest_job_logs(
+    logs_dir: Path,
+) -> Iterator[Tuple[int, Path, str, str, str, str, str]]:
+    """Yield the latest job log for each (config, suite, subsuite, workload, cluster_id) key.
+
+    Scans ``logs_dir`` for ``job_*.out`` files.  When multiple logs exist for the
+    same simulation key (re-runs produce higher Slurm job IDs), only the one with
+    the highest job ID is yielded — it supersedes OOM-killed or otherwise incomplete
+    earlier runs.
+
+    Yields ``(job_id_int, log_path, config, suite, subsuite, workload, cluster_id_str)``.
+    Files that cannot be parsed are silently skipped.
+    """
+    latest: Dict[Tuple[str, str, str, str, str], Tuple[int, Path]] = {}
+    for log_path in logs_dir.glob("job_*.out"):
+        try:
+            job_id_int = int(log_path.stem.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        try:
+            with log_path.open(encoding="utf-8", errors="replace") as fh:
+                first_line = fh.readline().strip()
+        except OSError:
+            continue
+        parsed = parse_job_log_header(first_line)
+        if parsed is None:
+            continue
+        config, suite, subsuite, workload, cluster_id_str = parsed
+        key = (config, suite, subsuite, workload, cluster_id_str)
+        if job_id_int > latest.get(key, (-1, log_path))[0]:
+            latest[key] = (job_id_int, log_path)
+    for (config, suite, subsuite, workload, cluster_id_str), (job_id_int, log_path) in latest.items():
+        yield (job_id_int, log_path, config, suite, subsuite, workload, cluster_id_str)
+
+
+def iter_latest_job_logs_with_mode(
+    logs_dir: Path,
+) -> Iterator[Tuple[int, Path, str, str, str, str, str, Optional[str]]]:
+    """Yield the latest job log for each (config, suite, subsuite, workload, cluster_id, sim_mode) key."""
+    latest: Dict[Tuple[str, str, str, str, str, str], Tuple[int, Path, Optional[str]]] = {}
+    for log_path in logs_dir.glob("job_*.out"):
+        try:
+            job_id_int = int(log_path.stem.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+
+        metadata = read_job_log_metadata(log_path)
+        if metadata is None:
+            continue
+
+        config, suite, subsuite, workload, cluster_id_str, sim_mode = metadata
+        key = (config, suite, subsuite, workload, cluster_id_str, sim_mode or "")
+        if job_id_int > latest.get(key, (-1, log_path, None))[0]:
+            latest[key] = (job_id_int, log_path, sim_mode)
+
+    for (config, suite, subsuite, workload, cluster_id_str, _sim_mode_key), (job_id_int, log_path, sim_mode) in latest.items():
+        yield (job_id_int, log_path, config, suite, subsuite, workload, cluster_id_str, sim_mode)
+
+def _scrub_ignorable_slurm_job_log_noise(log_text: str) -> str:
+    """Drop known non-fatal Slurm lines that trip substring-based error heuristics in status."""
+    out = []
+    for line in log_text.splitlines(keepends=True):
+        low = line.lower()
+        if "slurmstepd" in low and "unable to unlink domain socket" in low:
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def print_simulation_status_summary(
+    descriptor_data,
+    workloads_data,
+    docker_prefix_list,
+    user,
+    running_sims,
+    queued_sims,
+    dbg_lvl = 1,
+    all_nodes = None,
+    log_file_count_buffer = 0,
+    strict_log_count = False,
+    log_count_offset = 0,
+    prep_failed_label = "Failed - Slurm",
+):
+    all_jobs = get_simulation_jobs(descriptor_data, workloads_data, docker_prefix_list, user, dbg_lvl)
+
+    root_directory = os.path.join(
+        descriptor_data["root_dir"],
+        "simulations",
+        descriptor_data["experiment"],
+    )
+    root_logfile_directory = os.path.join(root_directory, "logs")
+    os.system(f"ls -R {root_directory} > /dev/null")
+
+    try:
+        all_log_files = os.listdir(root_logfile_directory)
+    except Exception:
+        print("Log file directory does not exist")
+        print("The current experiment does not seem to have been run yet")
+        return
+
+    if len(all_log_files) > len(all_jobs) + log_file_count_buffer:
+        print("More log files than total runs. Maybe same experiment name was run multiple times?")
+
+    # Single pass: build latest parseable logs (for status processing) and count all
+    # unique log entries including unparseable ones (for log_count_offset assertions).
+    _parseable: dict = {}   # (config, suite, subsuite, workload, cid) → (job_id, Path)
+    _unparseable: set = set()   # unique filenames for unparseable logs
+    for _lp in Path(root_logfile_directory).glob("job_*.out"):
+        try:
+            _jid = int(_lp.stem.split("_")[1])
+        except (IndexError, ValueError):
+            # e.g. the literal "job_%j.out" placeholder touched before sbatch submission
+            _unparseable.add(_lp.name)
+            continue
+        try:
+            with _lp.open(encoding="utf-8", errors="replace") as _fh:
+                _first = _fh.readline().strip()
+        except OSError:
+            continue
+        _parsed = parse_job_log_header(_first)
+        if _parsed is not None:
+            _key = _parsed  # (config, suite, subsuite, workload, cid)
+            if _jid > _parseable.get(_key, (-1, None))[0]:
+                _parseable[_key] = (_jid, _lp)
+        else:
+            _unparseable.add(_lp.name)
+
+    latest_logs = [
+        (_jid, _lp, config, suite, subsuite, workload, cid)
+        for (config, suite, subsuite, workload, cid), (_jid, _lp) in _parseable.items()
+    ]
+    # total_log_count mirrors the old len(log_files) which included unparseable entries;
+    # log_count_offset and strict_log_count are calibrated against this value.
+    total_log_count = len(latest_logs) + len(_unparseable)
+
+    error_runs = set()
+    sim_log_to_job_log = {}
+    skipped = 0
+
+    confs = list(descriptor_data["configurations"].keys())
+
+    completed = {conf: 0 for conf in confs}
+    failed = {conf: 0 for conf in confs}
+    prep_failed = {conf: 0 for conf in confs}
+    running = {conf: 0 for conf in confs}
+    pending = {conf: 0 for conf in confs}
+
+    experiment_name = descriptor_data["experiment"]
+    for sim in queued_sims:
+        matches = [conf for conf in confs if f"{experiment_name}_{conf}" in sim]
+        if not matches:
+            info(f"'{experiment_name}_{conf}' not found in any queued sim names", dbg_lvl)
+            continue
+        conf = max(matches, key=len)
+        pending[conf] += 1
+
+    all_job_ids = get_simulation_job_identifiers(descriptor_data, workloads_data, dbg_lvl=dbg_lvl)
+
+    not_in_experiment = []
+    oom_killed = []
+    oom_killed_sps = 0
+    descriptor_aligned_log_count = 0
+    for _job_id, log_path, config, suite, subsuite, workload, cluster_id in latest_logs:
+        if not (config, suite, subsuite, workload, int(cluster_id)) in all_job_ids:
+            continue
+
+        descriptor_aligned_log_count += 1
+        workload_path = f"{suite}/{subsuite}/{workload}"
+        with open(log_path, 'r') as f:
+            contents = f.read()
+            contents_after_docker = contents
+            if len(contents.split("\n")) < 2:
+                continue
+
+            scarab_logfile_path = os.path.join(
+                root_directory,
+                config,
+                workload_path,
+                cluster_id,
+                "sim.log",
+            )
+            sim_log_to_job_log[scarab_logfile_path] = str(log_path)
+
+            if config not in confs:
+                if config not in not_in_experiment:
+                    print(f"WARN: Log files for config {config}, which is not in the experiment file")
+                not_in_experiment.append(config)
+                continue
+
+            pattern = r"Script name: (\S*)"
+            match = re.search(pattern, contents)
+            if match:
+                script_name = match.group(1)
+                is_running = any(sim in script_name for sim in running_sims)
+                if is_running:
+                    skipped += 1
+                    running[config] += 1
+                    continue
+
+            if "BEGIN prepare_docker_image" in contents:
+                if "FAILED prepare_docker_image" in contents:
+                    prep_failed[config] += 1
+                    error_runs.add(str(log_path))
+                    print("Docker image preparation failed, Simulation is not running (Error message in log file)")
+                    continue
+
+                if "END prepare_docker_image" in contents:
+                    contents_after_docker = contents.split("END prepare_docker_image\n")[1]
+                else:
+                    prep_failed[config] += 1
+                    error_runs.add(str(log_path))
+                    print("Docker image preparation failed, Simulation is not running (Image prep never completed; no failure message)")
+                    continue
+            else:
+                print("Docker image preparation failed (Image prep never started)")
+                prep_failed[config] += 1
+                error_runs.add(str(log_path))
+                continue
+
+            if 'docker: Error' in contents_after_docker:
+                prep_failed[config] += 1
+                error_runs.add(str(log_path))
+                continue
+
+            prep_err = 0
+            workload_parts = workload_path.split("/")
+            sim_dir = Path(descriptor_data["root_dir"]) / "simulations" / descriptor_data["experiment"] / config
+            sim_dir = sim_dir.joinpath(*workload_parts, cluster_id)
+            has_csv = False
+            try:
+                has_csv = any(x.endswith(".csv") for x in os.listdir(sim_dir))
+            except OSError:
+                has_csv = False
+
+            status_scan_text = _scrub_ignorable_slurm_job_log_noise(contents_after_docker)
+
+            # If slurm cancelled wrapper execution but results were already produced, treat as completed.
+            if "cancelled" in status_scan_text.lower() and has_csv:
+                completed[config] += 1
+                continue
+
+            if all_nodes:
+                for node in all_nodes:
+                    if f"{node}: error:" in status_scan_text:
+                        error_runs.add(str(log_path))
+                        prep_failed[config] += 1
+                        prep_err = 1
+
+                        if "oom_kill" in status_scan_text:
+                            oom_killed_sps += 1
+                            if config not in oom_killed:
+                                oom_killed.append(config)
+
+            if prep_err:
+                continue
+
+            error = 0
+            if 'Segmentation fault' in status_scan_text:
+                error = 1
+
+            if 'error' in status_scan_text.lower():
+                error = 1
+
+            if "Completed Simulation" in status_scan_text and not error:
+                if has_csv:
+                    completed[config] += 1
+                    continue
+                err("Stat files not generated, despite being completed with no errors.", 1)
+
+            error_runs.add(scarab_logfile_path)
+            failed[config] += 1
+
+    print(f"Currently running {len(running_sims)} simulations (from logs: {skipped})")
+
+    calculated_logfile_count = 0
+    data = {
+        "Configuration": [],
+        "Completed": [],
+        "Failed": [],
+        prep_failed_label: [],
+        "Running": [],
+        "Pending": [],
+        "Non-existant": [],
+        "Total": [],
+    }
+    for conf in confs:
+        data["Configuration"].append(conf)
+        data["Completed"].append(completed[conf])
+        data["Failed"].append(failed[conf])
+        data[prep_failed_label].append(prep_failed[conf])
+        data["Running"].append(running[conf])
+        data["Pending"].append(pending[conf])
+
+        total_per_conf = int(len(all_jobs) / len(confs))
+        total_found = completed[conf] + failed[conf] + running[conf] + pending[conf] + prep_failed[conf]
+        calculated_logfile_count += total_found - pending[conf]
+
+        assert total_per_conf >= total_found, "ERR: Assert Failed: More jobs found (via squeue and log files) than should exist"
+
+        data["Total"].append(total_per_conf)
+        data["Non-existant"].append(total_per_conf - total_found)
+
+    if len(not_in_experiment) == 0:
+        if strict_log_count:
+            assert calculated_logfile_count == descriptor_aligned_log_count, "ERR: Assert Failed: Log file count doesn't match number of accounted jobs"
+        elif calculated_logfile_count != descriptor_aligned_log_count:
+            warn("Log file count doesn't match number of accounted jobs.", dbg_lvl)
+
+    print("PRINTING SUMMARY TABLE:")
+    print(generate_table(data))
+
+    if error_runs:
+        error_list = sorted(error_runs)
+        print(f"\033[31mErroneous Jobs: {len(error_list)}\033[0m")
+        print(f"\033[31mErrors found in {len(error_list)}/{len(latest_logs)} latest log files.")
+        print("First 5 error runs:\n", "\n".join(error_list[:5]), "\033[0m", sep='')
+        first_error_log = error_list[0]
+        print()
+        print(f"\033[94mTail of the first error ({first_error_log}):")
+        fallback_log = sim_log_to_job_log.get(first_error_log)
+        try:
+            with open(first_error_log, "r", errors="replace") as first_error_log_file:
+                tail_lines = list(deque(first_error_log_file, maxlen=20))
+            if tail_lines:
+                print("".join(tail_lines).rstrip("\n"))
+            elif fallback_log:
+                print(f"<empty log file; showing runner log fallback: {fallback_log}>")
+                try:
+                    with open(fallback_log, "r", errors="replace") as fallback_log_file:
+                        fallback_tail_lines = list(deque(fallback_log_file, maxlen=20))
+                    if fallback_tail_lines:
+                        print("".join(fallback_tail_lines).rstrip("\n"))
+                    else:
+                        print("<runner log is also empty>")
+                except OSError as fallback_exc:
+                    print(f"<unable to read runner log fallback: {fallback_exc}>")
+            else:
+                print("<empty log file>")
+        except OSError as exc:
+            if fallback_log:
+                print(f"<unable to read log file: {exc}; showing runner log fallback: {fallback_log}>")
+                try:
+                    with open(fallback_log, "r", errors="replace") as fallback_log_file:
+                        fallback_tail_lines = list(deque(fallback_log_file, maxlen=20))
+                    if fallback_tail_lines:
+                        print("".join(fallback_tail_lines).rstrip("\n"))
+                    else:
+                        print("<runner log is also empty>")
+                except OSError as fallback_exc:
+                    print(f"<unable to read runner log fallback: {fallback_exc}>")
+            else:
+                print(f"<unable to read log file: {exc}>")
+        print("\033[0m", end="")
+    else:
+        print(f"\033[92mNo errors found in log files\033[0m")
+
+    if oom_killed_sps > 0:
+        print()
+        print(f"\033[31mOOM Killed Jobs: {oom_killed_sps}\033[0m")
+        print("To fix: Run './sci --collect-mem <descriptor>' after jobs complete to record per-simpoint memory measurements. The infra will use these to schedule future runs with appropriate --mem limits.")
+        print("If jobs haven't run yet, set 'memory_overhead_mb' in the config entry within the descriptor to add a fixed overhead on top of the auto-scheduled base memory.")
+        print("OOM Killed Configs:\n", "\n".join(oom_killed), "\033[0m", sep='')
+
+def remove_docker_containers(docker_prefix_list, job_name, user, dbg_lvl):
+    try:
+        for docker_prefix in docker_prefix_list:
+            pattern = re.compile(fr"^{docker_prefix}_.*_{job_name}.*_.*_{user}$")
+            dockers = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"], capture_output=True, text=True, check=True)
+            lines = dockers.stdout.strip().split("\n") if dockers.stdout else []
+            matching_containers = [line for line in lines if pattern.match(line)]
+
+            if matching_containers:
+                for container in matching_containers:
+                    subprocess.run(["docker", "rm", "-f", container], check=True)
+                    info(f"Removed container: {container}", dbg_lvl)
+            else:
+                info("No containers found.", dbg_lvl)
+    except subprocess.CalledProcessError as e:
+        err(f"Error while removing containers: {e}")
+        raise e
+
+def remove_tmp_run_scripts(base_path, job_name, user, dbg_lvl):
+    pattern = re.compile(rf".*_{re.escape(job_name)}_.*_{re.escape(user)}_tmp_run\.sh$")
+    base = Path(base_path)
+    if not base.is_dir():
+        return
+
+    removed_any = False
+    for script_path in base.glob("*_tmp_run.sh"):
+        if not pattern.match(script_path.name):
+            continue
+        try:
+            script_path.unlink()
+            info(f"Removed temporary run script {script_path}", dbg_lvl)
+            removed_any = True
+        except OSError as exc:
+            warn(f"Failed to remove temporary run script {script_path}: {exc}", dbg_lvl)
+
+    if not removed_any and dbg_lvl >= 3:
+        info(f"No temporary run scripts found in {base}", dbg_lvl)
+
+def get_image_list(simulations, workloads_data):
+    image_list = []
+    simulations = normalize_simulations(simulations)
+    for simulation in simulations:
+        suite = simulation["suite"]
+        subsuite = simulation["subsuite"]
+        workload = simulation["workload"]
+        exp_cluster_id = simulation["cluster_id"]
+        sim_mode = simulation["simulation_type"]
+
+        if workload == None:
+            if subsuite == None:
+                for subsuite_ in workloads_data[suite].keys():
+                    for workload_ in workloads_data[suite][subsuite_].keys():
+                        if not isinstance(workloads_data[suite][subsuite_][workload_], dict):
+                            continue
+                        predef_mode = workloads_data[suite][subsuite_][workload_]["simulation"]["prioritized_mode"]
+                        sim_mode_ = sim_mode
+                        if sim_mode_ == None:
+                            sim_mode_ = predef_mode
+                        if sim_mode_ in workloads_data[suite][subsuite_][workload_]["simulation"].keys() and workloads_data[suite][subsuite_][workload_]["simulation"][sim_mode_]["image_name"] not in image_list:
+                            image_list.append(workloads_data[suite][subsuite_][workload_]["simulation"][sim_mode_]["image_name"])
+            else:
+                for workload_ in workloads_data[suite][subsuite].keys():
+                    if not isinstance(workloads_data[suite][subsuite][workload_], dict):
+                        continue
+                    predef_mode = workloads_data[suite][subsuite][workload_]["simulation"]["prioritized_mode"]
+                    sim_mode_ = sim_mode
+                    if sim_mode_ == None:
+                        sim_mode_ = predef_mode
+                    if sim_mode_ in workloads_data[suite][subsuite][workload_]["simulation"].keys() and workloads_data[suite][subsuite][workload_]["simulation"][sim_mode_]["image_name"] not in image_list:
+                        image_list.append(workloads_data[suite][subsuite][workload_]["simulation"][sim_mode_]["image_name"])
+        else:
+            if subsuite == None:
+                found = False
+                for subsuite_ in workloads_data[suite].keys():
+                    if not workload in workloads_data[suite][subsuite_].keys():
+                        continue
+
+                    found = True
+                    predef_mode = workloads_data[suite][subsuite_][workload]["simulation"]["prioritized_mode"]
+                    sim_mode_ = sim_mode
+                    if sim_mode_ == None:
+                        sim_mode_ = predef_mode
+                    if sim_mode_ in workloads_data[suite][subsuite_][workload]["simulation"].keys() and workloads_data[suite][subsuite_][workload]["simulation"][sim_mode_]["image_name"] not in image_list:
+                        image_list.append(workloads_data[suite][subsuite_][workload]["simulation"][sim_mode_]["image_name"])
+                assert found, f"Workload {workload} could not be found for any subsuite of {suite}. Check descriptor validation code"
+            else:
+                predef_mode = workloads_data[suite][subsuite][workload]["simulation"]["prioritized_mode"]
+                sim_mode_ = sim_mode
+                if sim_mode_ == None:
+                    sim_mode_ = predef_mode
+                if sim_mode_ in workloads_data[suite][subsuite][workload]["simulation"].keys() and workloads_data[suite][subsuite][workload]["simulation"][sim_mode_]["image_name"] not in image_list:
+                    image_list.append(workloads_data[suite][subsuite][workload]["simulation"][sim_mode_]["image_name"])
+
+    return image_list
+
+def get_docker_prefix(sim_mode, simulation_data):
+    if sim_mode not in simulation_data.keys():
+        err(f"{sim_mode} is not a valid simulation type.")
+        exit(1)
+    return simulation_data[sim_mode]["image_name"]
+
+def get_weight_by_cluster_id(exp_cluster_id, simpoints):
+    for simpoint in simpoints:
+        if simpoint["cluster_id"] == exp_cluster_id:
+            return simpoint["weight"]
+
+def prepare_trace(user, scarab_path, scarab_build, docker_home, job_name, infra_dir, docker_prefix_list, githash, interactive_shell=False, available_slurm_nodes=[], dbg_lvl=1, rebuild_hint=None):
+    try:
+        scarab_githash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=scarab_path).decode("utf-8").strip()
+    except Exception as e:
+        err(f"Could not get scarab githash: {str(e)}", dbg_lvl)
+        raise e
+
+    info(f"Current scarab git hash: {scarab_githash}", dbg_lvl)
+
+    if not os.path.exists(f"{infra_dir}/scarab_builds"):
+        os.system(f"mkdir -p {infra_dir}/scarab_builds")
+
+    docker_prefix = docker_prefix_list[0]
+    docker_container_name = None
+    try:
+        local_uid = os.getuid()
+        local_gid = os.getgid()
+        build_mode = scarab_build if scarab_build else "opt"
+
+        trace_dir = f"{docker_home}/simpoint_flow/{job_name}"
+        os.system(f"mkdir -p {trace_dir}/scarab/src/")
+
+        if interactive_shell:
+            _warn_interactive_binary_statuses(
+                infra_dir,
+                scarab_path,
+                scarab_githash,
+                dbg_lvl,
+                rebuild_hint=rebuild_hint,
+            )
+            current_cache_name = _cache_bin_name("scarab_current", build_mode)
+            current_scarab_bin = f"{infra_dir}/scarab_builds/{current_cache_name}"
+            repo_scarab_bin = f"{scarab_path}/src/build/{build_mode}/scarab"
+            if os.path.isfile(current_scarab_bin):
+                info(
+                    f"Using cached Scarab binary for interactive mode: {current_scarab_bin}",
+                    dbg_lvl,
+                )
+            elif os.path.isfile(repo_scarab_bin):
+                shutil.copy2(repo_scarab_bin, current_scarab_bin)
+                info(
+                    "Interactive mode: reused existing Scarab repo binary without rebuilding.",
+                    dbg_lvl,
+                )
+            else:
+                warn(
+                    "Interactive mode requested, but no cached or repo Scarab binary exists; "
+                    "continuing without rebuilding.",
+                    dbg_lvl,
+                )
+        else:
+            # (Re)build the scarab binary first.
+            rebuild_scarab(infra_dir, scarab_path, user, docker_home, docker_prefix, githash, scarab_githash, scarab_build, stream_build=False, dbg_lvl=dbg_lvl)
+
+        # Copy current scarab binary to trace dir
+        cache_name = _cache_bin_name("scarab_current", build_mode)
+        scarab_ver = f"{infra_dir}/scarab_builds/{cache_name}"
+        if os.path.isfile(scarab_ver):
+            os.system(f"cp {scarab_ver} {trace_dir}/scarab/src/scarab")
+        elif interactive_shell:
+            warn(
+                f"Skipping missing interactive Scarab binary: {scarab_ver}",
+                dbg_lvl,
+            )
+        else:
+            raise FileNotFoundError(f"Required Scarab binary not found: {scarab_ver}")
+
+        os.system(f"mkdir -p {trace_dir}/scarab/bin/scarab_globals")
+        os.system(f"cp {scarab_path}/bin/scarab_launch.py  {trace_dir}/scarab/bin/scarab_launch.py ")
+        os.system(f"cp {scarab_path}/bin/scarab_globals/*  {trace_dir}/scarab/bin/scarab_globals/ ")
+        os.system(f"mkdir -p {trace_dir}/scarab/utils/memtrace")
+        os.system(f"cp {scarab_path}/utils/memtrace/* {trace_dir}/scarab/utils/memtrace/ ")
+    except subprocess.CalledProcessError as e:
+        if docker_container_name:
+            try:
+                subprocess.run(["docker", "rm", "-f", docker_container_name], check=True)
+                info(f"Removed container: {docker_container_name}", dbg_lvl)
+            except subprocess.CalledProcessError:
+                info(f"Could not remove container: {docker_container_name}", dbg_lvl)
+        info(f"Scarab build failed: {e.stderr if isinstance(e.stderr, str) else e.stderr.decode() if e.stderr else str(e)}", dbg_lvl)
+        raise e
+    except Exception as e:
+        if docker_container_name:
+            try:
+                subprocess.run(["docker", "rm", "-f", docker_container_name], check=True)
+                info(f"Removed container: {docker_container_name}", dbg_lvl)
+            except subprocess.CalledProcessError:
+                info(f"Could not remove container: {docker_container_name}", dbg_lvl)
+        info(f"Unexpected error during scarab build: {str(e)}", dbg_lvl)
+        raise e
+
+def finish_trace(user, descriptor_data, workload_db_path, infra_dir, dbg_lvl):
+    def read_first_line(file_path):
+        with open(file_path, 'r') as f:
+            value = f.readline().rstrip('\n')
+        return value
+
+    def read_weight_file(file_path):
+        weights = {}
+        with open(file_path, 'r') as f:
+            for line in f:
+                parts = line.split()
+                weight = float(parts[0])
+                segment_id = int(parts[1])
+                weights[segment_id] = weight
+        return weights
+
+    def read_cluster_file(file_path):
+        clusters = {}
+        with open(file_path, 'r') as f:
+            for line in f:
+                parts = line.split()
+                cluster_id = int(parts[0])
+                segment_id = int(parts[1])
+                clusters[segment_id] = cluster_id
+        return clusters
+
+    try:
+        workload_db_data = read_descriptor_from_json(workload_db_path, dbg_lvl)
+        trace_configs = descriptor_data["trace_configurations"]
+        job_name = descriptor_data["trace_name"]
+        trace_dir = f"{descriptor_data['root_dir']}/simpoint_flow/{job_name}"
+        target_traces_dir = descriptor_data["traces_dir"]
+        docker_home = descriptor_data["root_dir"]
+
+        print("Copying the successfully collected traces and update workloads_db.json...")
+
+        for config in trace_configs:
+            workload = config['workload']
+            suite = config['suite']
+            subsuite = config['subsuite']
+
+            # Update workload_db_data
+            trace_dict = {}
+            trace_dict['dynamorio_args'] = config['dynamorio_args']
+            trace_dict['clustering_k'] = config['clustering_k']
+
+            simulation_dict = {}
+            exec_dict = {}
+            exec_dict['image_name'] = config['image_name']
+            segment_size_file = os.path.join(trace_dir, workload, "fingerprint", "segment_size")
+            exec_dict['segment_size'] = int(read_first_line(segment_size_file))
+            exec_dict['env_vars'] = config['env_vars']
+            exec_dict['binary_cmd'] = config['binary_cmd']
+            exec_dict['client_bincmd'] = config['client_bincmd']
+            memtrace_dict = {}
+            memtrace_dict['image_name'] = "allbench_traces"
+            memtrace_dict['segment_size'] = int(read_first_line(segment_size_file))
+
+            weight_file = os.path.join(trace_dir, workload, "simpoints", "opt.w.lpt0.99")
+            cluster_file = os.path.join(trace_dir, workload, "simpoints", "opt.p.lpt0.99")
+            weights = read_weight_file(weight_file)
+            clusters = read_cluster_file(cluster_file)
+            simpoints = []
+            # Match segment IDs between weight and cluster files
+            for segment_id, weight in weights.items():
+                if segment_id in clusters:
+                    simpoints.append({
+                        'cluster_id': clusters[segment_id],
+                        'segment_id': segment_id,
+                        'weight': weight
+                    })
+
+            target_traces_path = f"{target_traces_dir}/{suite}/{subsuite}/{workload}"
+            # Copy successfully collected traces to target_traces_dir (simpoints are recorded in workloads_db.json)
+            os.system(f"mkdir -p {target_traces_path}/traces/whole")
+            os.system(f"mkdir -p {target_traces_path}/traces/simp")
+            trace_clustering_info = read_descriptor_from_json(os.path.join(trace_dir, workload, "trace_clustering_info.json"), dbg_lvl)
+            if config['trace_type'] == "trace_then_cluster":
+                os.system(f"cp -r {trace_dir}/{workload}/traces_simp/* {target_traces_path}/traces/simp/")
+                os.system(f"mkdir -p {target_traces_path}/traces/whole/")
+                whole_trace_dir = trace_clustering_info['dr_folder']
+                trace_file = trace_clustering_info['trace_file']
+                subprocess.run([f"cp {trace_dir}/{workload}/traces/whole/{whole_trace_dir}/trace/{trace_file} {target_traces_path}/traces/whole/"], check=True, shell=True)
+                memtrace_dict['warmup'] = 50000000
+                memtrace_dict['whole_trace_file'] = trace_clustering_info['trace_file']
+            elif config['trace_type'] == "cluster_then_trace":
+                os.system(f"cp -r {trace_dir}/{workload}/traces_simp/trace/* {target_traces_path}/traces/simp/")
+                memtrace_dict['warmup'] = 50000000
+                memtrace_dict['whole_trace_file'] = None
+                print("cluster_then_trace doesn't have a whole trace file.")
+            else: # iterative_trace
+                largest_traces = trace_clustering_info['trace_file']
+                for trace_path in largest_traces:
+                    print("Processing trace:", trace_path)
+                    prefix = "traces_simp/"
+                    if prefix in trace_path:
+                        relative_part = trace_path.split(prefix, 1)[1]
+                        timestep = trace_path.split("Timestep_")[1].split("/")[0]
+                        trace_source = os.path.join(trace_dir, workload, "traces_simp", relative_part)
+                        trace_dest_dir = os.path.join(target_traces_path, "traces/simp")
+                        trace_dest = os.path.join(target_traces_path, "traces/simp", f"{timestep}.zip")
+
+                        os.makedirs(os.path.dirname(trace_dest_dir), exist_ok=True)
+                        os.system(f"cp -r {trace_source} {trace_dest}")
+                memtrace_dict['warmup'] = 0
+                memtrace_dict['whole_trace_file'] = None
+            memtrace_dict['trace_type'] = config['trace_type']
+
+            os.system(f"chmod a+w -R {target_traces_path}")
+            simulation_dict['prioritized_mode'] = "memtrace"
+            simulation_dict['exec'] = exec_dict
+            simulation_dict['memtrace'] = memtrace_dict
+            suite = config['suite']
+            subsuite = config['subsuite'] if config['subsuite'] else suite
+            workload_dict = {
+                "trace":trace_dict,
+                "simulation":simulation_dict,
+                "simpoints":simpoints
+            }
+
+            if suite in workload_db_data.keys() and subsuite in workload_db_data[suite].keys() and workload in workload_db_data[suite][subsuite].keys():
+                print("WARNING: workload name should be unique within a subsuite. db will be overwritten!")
+            workload_db_data[suite][subsuite][workload] = workload_dict
+
+        write_json_descriptor(workload_db_path, workload_db_data, dbg_lvl)
+        extract_top_simpoints.modify_simpoints_in_place(workload_db_data)
+        write_json_descriptor(f"{infra_dir}/workloads/workloads_top_simp.json", workload_db_data, dbg_lvl)
+
+
+    except Exception as e:
+        raise e
+
+def is_container_running(container_name, dbg_lvl):
+    client = get_docker_client()
+    if client is None:
+        warn("Docker client unavailable; cannot inspect containers.", dbg_lvl)
+        return False
+    try:
+        container = client.containers.get(container_name)
+        info(f"container {container_name} is already running.", dbg_lvl)
+        return container.status == "running"
+    except Exception as exc:
+        info(f"Failed to query container {container_name}: {exc}", dbg_lvl)
+        return False
+
+def count_interactive_shells(container_name, dbg_lvl):
+    if docker is None:
+        warn("Docker client unavailable; assuming 0 interactive shells.", dbg_lvl)
+        return 0
+    try:
+        client_api = docker.APIClient()
+    except Exception as exc:
+        warn(f"Docker API client unavailable: {exc}", dbg_lvl)
+        return 0
+    try:
+        container = client_api.inspect_container(container_name)
+        container_id = container['Id']
+        processes = client_api.top(container_id)
+
+        shell_count = 0
+        for process in processes['Processes']:
+            cmd = ' '.join(process)
+            # Check for common interactive shells
+            if any(shell in cmd for shell in ['bash', 'sh', 'zsh']):
+                shell_count += 1
+        info(f"{shell_count} shells are running for {container_name}.", dbg_lvl)
+        return shell_count
+    except Exception as exc:
+        print(f"Error checking shells for '{container_name}': {exc}")
+        return 0
+
+def image_exist(image_tag, node=None):
+    try:
+        output = subprocess.run(["docker", "images", "-q", image_tag], capture_output=True, text=True)
+        return bool(output.stdout.strip())
+    except subprocess.CalledProcessError:
+        return False
+
+# Returns true if experiment exists
+def check_sp_exist (descriptor_data, config_key, suite, subsuite, workload, exp_cluster_id):
+    # Check if simpoint exists
+    experiment_dir =  f"{descriptor_data['root_dir']}/simulations/{descriptor_data['experiment']}/"
+    experiment_dir += f"{config_key}/{suite}/{subsuite}/{workload}/{exp_cluster_id}"
+
+    #print(experiment_dir)
+
+    inst_stat_path = Path(experiment_dir) / "inst.stat.0.csv"
+    if inst_stat_path.is_file():
+        return True
+
+    # Previous runs without a completed inst.stat.0.csv should be retried
+    return False
+
+# Returns true if experiment failed
+def check_sp_failed (descriptor_data, config_key, suite, subsuite, workload, exp_cluster_id):
+    # Check if simpoint exists
+    experiment_dir =  f"{descriptor_data['root_dir']}/simulations/{descriptor_data['experiment']}/"
+    experiment_dir += f"{config_key}/{suite}/{subsuite}/{workload}/{exp_cluster_id}"
+
+    if Path(experiment_dir).is_dir() == False:
+        return True
+
+    # Failed case; CSV files not generated. Ignoring .csv.warmup files.
+    if len(list(filter(lambda x: x.endswith('.csv'), os.listdir(experiment_dir)))) == 0:
+        return True
+
+    # Success case
+    return False
+
+# Clean up failed run
+def clean_failed_run (descriptor_data, config_key, suite, subsuite, workload, exp_cluster_id, dbg_lvl=1):
+    # Remove failed run artifacts while preserving directory structure
+    experiment_dir =  f"{descriptor_data['root_dir']}/simulations/{descriptor_data['experiment']}/"
+    experiment_dir += f"{config_key}/{suite}/{subsuite}/{workload}/{exp_cluster_id}"
+
+    experiment_path = Path(experiment_dir)
+    patterns_to_clean = ["*.csv", "*.out", "*.in", "*.csv.warmup", "*.out.warmup", "sim.log"]
+
+    try:
+        if experiment_path.is_dir():
+            for pattern in patterns_to_clean:
+                for target in experiment_path.glob(pattern):
+                    if target.is_file() or target.is_symlink():
+                        target.unlink()
+    except Exception as e:
+        err(f"Error cleaning files in {experiment_dir}: {e}", 1)
+
+    # Wipe log file
+    log_dir =  Path(f"{descriptor_data['root_dir']}/simulations/{descriptor_data['experiment']}/logs/")
+    log_files = log_dir.glob("log_*.out")
+    for file in log_files:
+        with open(file, 'r') as f:
+            lines = f.readlines()
+
+            # Logfile will have {config} {suite}/{subsuite}/{workload} {simpoint} as header
+            header = f"Running {config_key} {suite}/{subsuite}/{workload} {exp_cluster_id}\n"
+            if header in lines:
+                info(f"Removing log entry for failed run: {header.strip()}", dbg_lvl)
+                file.unlink()
+
+# Check if run was already successful, and thus skippable
+# Please use as follows:
+# if check_can_skip(...):
+#     continue
+def check_can_skip (descriptor_data, config_key, suite, subsuite, workload, cluster_id, filename, dbg_lvl=1):
+    # Check if it is about to be run
+    if os.path.exists(filename):
+        # Run script has generated run file, it will be run shortly.
+        info(f"Run script for {config_key} for workload {workload} exists. Other script will run it.", dbg_lvl)
+        return True
+
+    # If CSV files don't exist, clean up failed run and re-run (can skip = False)
+    if check_sp_failed(descriptor_data, config_key, suite, subsuite, workload, cluster_id):
+        info(f"Previous run with config {config_key} for workload {workload} failed. Cleaning directory and Re-running.", dbg_lvl)
+        clean_failed_run(descriptor_data, config_key, suite, subsuite, workload, cluster_id, dbg_lvl=dbg_lvl)
+        return False
+        
+    # Since sp_failed returned false, we know csv files exist. No need to re-run.
+    info(f"Run with config {config_key} for workload {workload} already completed. Skipping.", dbg_lvl)
+    return True
+    
+def generate_table(data, title=""):
+    """
+    Generates a formatted table as a string, handling potential formatting issues
+    with varying integer sizes.
+
+    Args:
+        data (dict): A dictionary containing the table data.  The keys of the
+            dictionary are the column headers, and the values are lists
+            representing the data for each column.  It is assumed that all
+            lists have the same length.
+        title (str, optional): An optional title for the table. Defaults to "".
+
+    Returns:
+        str: A string representing the formatted table.
+    """
+    
+    if not data:
+        return "No data provided."
+
+    headers = list(data.keys())
+    num_cols = len(headers)
+    num_rows = len(data[headers[0]])
+
+    # Calculate maximum width for each column based on header and data lengths
+    column_widths = [len(header) for header in headers]
+    for i in range(num_cols):
+        for j in range(num_rows):
+            column_widths[i] = max(column_widths[i], len(str(data[headers[i]][j])))
+
+    # Create the table format string
+    format_string = " | ".join(f"{{:<{width}}}" for width in column_widths)
+    separator = "-" * (sum(column_widths) + 3 * (num_cols - 1))
+
+    table_string = ""
+    if title:
+        table_string += f"{title.center(len(separator))}\n"
+
+    # Add the header row
+    table_string += format_string.format(*headers) + "\n"
+    table_string += separator + "\n"
+
+    # Add the data rows
+    for j in range(num_rows):
+        row_data = [data[header][j] for header in headers]
+        row_string = format_string.format(*row_data) + "\n"
+        table_string += row_string.replace(' 0 ', ' \033[30m0\033[0m ')
+
+    return table_string

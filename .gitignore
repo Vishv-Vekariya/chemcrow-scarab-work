@@ -1,0 +1,11 @@
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+credentials*
+.netrc
+*.pfx
+__pycache__/
+*.pyc
+.DS_Store
